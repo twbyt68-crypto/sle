@@ -43,6 +43,11 @@ API_HASH = os.getenv("API_HASH", "").strip()
 FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
 DB_PATH = os.getenv("DB_PATH", "manager.sqlite3")
 POLL_INTERVAL = max(0.1, float(os.getenv("POLL_INTERVAL", "0.5")))
+USE_BUTTON_STYLES = os.getenv("USE_BUTTON_STYLES", "true").lower() in {"1", "true", "yes", "on"}
+STYLE_PRIMARY = "primary"
+STYLE_SUCCESS = "success"
+STYLE_DANGER = "danger"
+VALID_STYLES = {STYLE_PRIMARY, STYLE_SUCCESS, STYLE_DANGER}
 RECENT_MESSAGES = 50
 DEFAULT_INTERVAL_MINUTES = 3.0
 DEFAULT_TIMEOUT_SECONDS = 15.0
@@ -185,7 +190,7 @@ class Store:
 
     def create_account(self, name: str, session: str) -> int:
         now = utc_now(); blob = CRYPTO.encrypt(session.encode()).decode()
-        return self.execute("INSERT INTO accounts(name,session_blob,created_at,updated_at) VALUES(?,?,?,?,?)", (name, blob, now, now)).lastrowid
+        return self.execute("INSERT INTO accounts(name,session_blob,created_at,updated_at) VALUES(?,?,?,?)", (name, blob, now, now)).lastrowid
 
     def update_account(self, ident: int, name: str, session: str | None = None):
         if session:
@@ -351,11 +356,25 @@ class ManagerBot:
     def __init__(self):
         self.api=f"https://api.telegram.org/bot{MANAGER_BOT_TOKEN}"; self.store=Store(); self.hub=WorkerHub(self.store); self.flows={}; self.offset=0
 
+    def _remove_button_styles(self, value):
+        if isinstance(value, dict): return {k:self._remove_button_styles(v) for k,v in value.items() if k not in {"style","icon_custom_emoji_id"}}
+        if isinstance(value, list): return [self._remove_button_styles(v) for v in value]
+        return value
     def api_call(self, method: str, **payload):
         response=requests.post(f"{self.api}/{method}",json=payload,timeout=40); response.raise_for_status(); data=response.json()
-        if not data.get("ok"): raise RuntimeError(data.get("description","Telegram API error"))
+        if not data.get("ok"):
+            description=data.get("description","Telegram API error")
+            if USE_BUTTON_STYLES and "style" in json.dumps(payload, ensure_ascii=False):
+                log.warning("Styled keyboard rejected; retrying without styles: %s", description)
+                return self.api_call(method, **self._remove_button_styles(payload))
+            raise RuntimeError(description)
         return data["result"]
-    def button(self,text,data): return {"text":text,"callback_data":data}
+    def button(self,text,data,style=None):
+        if style is None:
+            style=STYLE_DANGER if any(x in data for x in ("delete","cancel","clear")) else STYLE_SUCCESS if any(x in data for x in ("add","test","run","toggle","enable")) else STYLE_PRIMARY
+        result={"text":text,"callback_data":data}
+        if USE_BUTTON_STYLES and style in VALID_STYLES: result["style"]=style
+        return result
     def button_row(self,*items): return [self.button(text,data) for text,data in items]
     def safe_button(self,text,data): return self.button(clean(text)[:32], clean(data)[:64])
     def send(self,chat,text,keys=None,edit=None):
