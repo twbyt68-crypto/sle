@@ -350,6 +350,7 @@ class Flow:
     values: list[str] = field(default_factory=list)
     index: int = 0
     edit_id: int | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 class ManagerBot:
@@ -414,8 +415,20 @@ class ManagerBot:
     def audit(self,chat,edit=None):
         rows=self.audit_rows(); lines=[f"• <code>{safe_html(r['created_at'])}</code> — {safe_html(r['action'])} {safe_html(r['details'])}" for r in rows]
         self.send(chat,"<b>🧾 گزارش فعالیت</b>\n"+("\n".join(lines) or "موردی ثبت نشده است."),self.back(),edit)
-    def begin(self,user,chat,kind,prompts,edit=None):
-        self.flows[user]=Flow(kind,prompts,edit_id=edit); self.send(chat,f"<b>مرحلهٔ ۱ از {len(prompts)}</b>\n{prompts[0]}\n\nلغو: /cancel",[[self.button("❌ لغو","cancel")]])
+    def begin(self,user,chat,kind,prompts,edit=None,meta=None):
+        self.flows[user]=Flow(kind,prompts,edit_id=edit,meta=meta or {}); self.send(chat,f"<b>مرحلهٔ ۱ از {len(prompts)}</b>\n{prompts[0]}\n\nلغو: /cancel",[[self.button("❌ لغو","cancel")]])
+    def choose_account(self, chat, action, edit=None):
+        rows=[[self.button(f"👤 {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.accounts() if row['enabled']]
+        rows.append([self.button("↩️ بازگشت", "accounts" if action == "edit_account_pick" else "scenarios")])
+        self.send(chat, "<b>حساب را انتخاب کنید</b>\nشناسه را دستی وارد نکنید.", rows, edit)
+    def choose_scenario(self, chat, action, edit=None):
+        rows=[[self.button(f"⚙️ {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.scenarios()]
+        rows.append([self.button("↩️ بازگشت", "scenarios")])
+        self.send(chat, "<b>سناریو را انتخاب کنید</b>\nشناسه را دستی وارد نکنید.", rows, edit)
+    def choose_account_action(self, chat, action, edit=None):
+        rows=[[self.button(f"👤 {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.accounts()]
+        rows.append([self.button("↩️ بازگشت", "accounts")])
+        self.send(chat, "<b>حساب را انتخاب کنید</b>\nشناسه داخلی از داخل دکمه انتخاب می‌شود.", rows, edit)
     def prompt_next(self,user,chat):
         flow=self.flows[user]; self.send(chat,f"<b>مرحلهٔ {flow.index+1} از {len(flow.prompts)}</b>\n{flow.prompts[flow.index]}\n\nلغو: /cancel",[[self.button("❌ لغو","cancel")]])
     def receive_flow(self,user,chat,text):
@@ -424,20 +437,32 @@ class ManagerBot:
         flow.values.append(text.strip()); flow.index+=1
         if flow.index<len(flow.prompts): return self.prompt_next(user,chat)
         values=flow.values; self.flows.pop(user,None)
-        try: result=self.commit_flow(user,flow.kind,values)
+        try: result=self.commit_flow(user,flow.kind,values,flow.meta)
         except Exception as exc: log.exception("form commit failed"); result=f"❌ خطا: {safe_html(exc)}"
         self.send(chat,result,[[self.button("↩️ منوی اصلی","home")]])
-    def commit_flow(self,user,kind,v):
+    def commit_flow(self,user,kind,v,meta=None):
+        meta=meta or {}
         if kind=="add_account":
             ident=self.store.create_account(clean(v[0]),clean(v[1])); self.store.audit(user,"account-add",str(ident)); self.hub.start(ident); return "✅ حساب و Session ثبت شد و Worker در حال اتصال است."
         if kind=="edit_account":
-            ident=int(v[0]); self.store.update_account(ident,clean(v[1]),clean(v[2]) or None); self.store.audit(user,"account-edit",str(ident)); self.hub.restart(ident); return "✅ حساب ویرایش شد."
+            ident=int(meta.get("account_id", 0))
+            if not self.store.account(ident): raise ValueError("حساب انتخاب‌شده پیدا نشد")
+            self.store.update_account(ident,clean(v[0]),clean(v[1]) or None); self.store.audit(user,"account-edit",str(ident)); self.hub.restart(ident); return "✅ حساب ویرایش شد."
         if kind in ("add_scenario","edit_scenario"):
             if kind == "add_scenario":
-                name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),int(v[2]),clean(v[3]),clean(v[4]),number(v[5]),number(v[6],1)
+                if len(v) == 6:
+                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(meta["account_id"]),int(v[1]),clean(v[2]),clean(v[3]),number(v[4]),number(v[5],1)
+                else:
+                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),int(v[2]),clean(v[3]),clean(v[4]),number(v[5]),number(v[6],1)
+                if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد یا حذف شده است")
                 ident=self.store.create_scenario(name,aid,cid,keyword,button,minutes,timeout); action="scenario-add"
             else:
-                ident=int(v[0]); name,aid,cid,keyword,button,minutes,timeout=clean(v[1]),int(v[2]),int(v[3]),clean(v[4]),clean(v[5]),number(v[6]),number(v[7],1)
+                if len(v) == 6:
+                    ident=int(meta.get("scenario_id", 0)); aid=int(meta.get("account_id", 0)); name,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),clean(v[2]),clean(v[3]),number(v[4]),number(v[5],1)
+                else:
+                    ident=int(v[0]); name,aid,cid,keyword,button,minutes,timeout=clean(v[1]),int(v[2]),int(v[3]),clean(v[4]),clean(v[5]),number(v[6]),number(v[7],1)
+                if not self.store.scenario(ident): raise ValueError("سناریوی انتخاب‌شده وجود ندارد")
+                if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد")
                 self.store.update_scenario(ident,name,aid,cid,keyword,button,minutes,timeout); action="scenario-edit"
             self.store.audit(user,action,str(ident)); self.hub.start(aid); return "✅ سناریو ذخیره شد. برای اجرای خودکار آن را روشن کنید."
         if kind=="set_poll": self.store.set_setting("poll_seconds",str(number(v[0]))); self.store.audit(user,"poll-change",v[0]); return "✅ فاصلهٔ polling ذخیره شد؛ مقدار محیطی فعلی پس از Restart اعمال می‌شود."
@@ -464,19 +489,74 @@ class ManagerBot:
         if data=="list_accounts": return self.list_accounts(chat,msg)
         if data=="list_scenarios": return self.list_scenarios(chat,msg)
         if data=="add_account": return self.begin(user,chat,data,["نام نمایشی حساب","Session String کامل Telethon"],msg)
-        if data=="edit_account": return self.begin(user,chat,data,["شناسه حساب","نام جدید","Session جدید؛ برای حفظ قبلی خالی بفرستید"],msg)
-        if data=="add_scenario": return self.begin(user,chat,data,["نام سناریو","شناسه حساب","chat_id گروه مثل -1001234567890","کلمه یا فرمان","متن دکمه؛ بدون دکمه خالی بفرستید","فاصله برحسب دقیقه؛ مثل 1 یا 0.5","timeout برحسب ثانیه؛ مثل 15"],msg)
-        if data=="edit_scenario": return self.begin(user,chat,data,["شناسه سناریو","نام جدید","شناسه حساب","chat_id گروه","کلمه یا فرمان","متن دکمه؛ بدون دکمه خالی","فاصله برحسب دقیقه","timeout برحسب ثانیه"],msg)
+        if data=="edit_account": return self.choose_account_action(chat,"pick_edit_account",msg)
+        if data.startswith("pick_edit_account:"):
+            ident=int(data.split(":",1)[1]); row=self.store.account(ident)
+            if not row: return self.send(chat,"❌ حساب پیدا نشد.",self.back("accounts"),msg)
+            return self.begin(user,chat,"edit_account",["نام جدید","Session جدید؛ برای حفظ قبلی خالی بفرستید"],msg,{"account_id":ident})
+        if data=="add_scenario": return self.choose_account(chat,"pick_scenario_account",msg)
+        if data.startswith("pick_scenario_account:"):
+            aid=int(data.split(":",1)[1]);
+            if not self.store.account(aid): return self.send(chat,"❌ این حساب دیگر وجود ندارد؛ دوباره انتخاب کنید.",self.back("scenarios"),msg)
+            return self.begin(user,chat,"add_scenario",["نام سناریو","chat_id گروه مثل -1001234567890","کلمه یا فرمان","متن دکمه؛ بدون دکمه خالی بفرستید","فاصله برحسب دقیقه؛ مثل 1 یا 0.5","timeout برحسب ثانیه؛ مثل 15"],msg,{"account_id":aid})
+        if data=="edit_scenario": return self.choose_scenario(chat,"pick_edit_scenario",msg)
+        if data.startswith("pick_edit_scenario:"):
+            ident=int(data.split(":",1)[1]); row=self.store.scenario(ident)
+            if not row: return self.send(chat,"❌ سناریو پیدا نشد.",self.back("scenarios"),msg)
+            return self.begin(user,chat,"edit_scenario",["نام جدید","chat_id گروه","کلمه یا فرمان","متن دکمه؛ بدون دکمه خالی","فاصله برحسب دقیقه","timeout برحسب ثانیه"],msg,{"scenario_id":ident,"account_id":row["account_id"]})
         if data=="set_poll": return self.begin(user,chat,data,["فاصله polling برحسب ثانیه؛ پیشنهاد 0.5"],msg)
         if data=="set_timeout": return self.begin(user,chat,data,["timeout پیش‌فرض برحسب ثانیه"],msg)
-        if data=="toggle_account": return self.begin(user,chat,data,["شناسه حساب","روشن یا خاموش"],msg)
-        if data=="delete_account": return self.begin(user,chat,data,["شناسه حساب برای حذف","برای تأیید، کلمه حذف را بنویسید"],msg)
-        if data=="toggle_scenario": return self.begin(user,chat,data,["شناسه سناریو","روشن یا خاموش"],msg)
-        if data=="delete_scenario": return self.begin(user,chat,data,["شناسه سناریو برای حذف","برای تأیید، کلمه حذف را بنویسید"],msg)
+        if data=="toggle_account": return self.choose_account_action(chat,"pick_toggle_account",msg)
+        if data.startswith("pick_toggle_account:"):
+            ident=int(data.split(":",1)[1]); return self.toggle_choice(chat,"account",ident,msg)
+        if data=="delete_account": return self.choose_account_action(chat,"pick_delete_account",msg)
+        if data.startswith("pick_delete_account:"):
+            ident=int(data.split(":",1)[1]); return self.confirm_delete(chat,"account",ident,msg)
+        if data=="toggle_scenario": return self.choose_scenario(chat,"pick_toggle_scenario",msg)
+        if data.startswith("pick_toggle_scenario:"):
+            ident=int(data.split(":",1)[1]); return self.toggle_choice(chat,"scenario",ident,msg)
+        if data=="delete_scenario": return self.choose_scenario(chat,"pick_delete_scenario",msg)
+        if data.startswith("pick_delete_scenario:"):
+            ident=int(data.split(":",1)[1]); return self.confirm_delete(chat,"scenario",ident,msg)
+        if data.startswith("confirm_toggle:"):
+            _,kind,ident,enabled=data.split(":"); return self.confirm_toggle_callback(user,chat,kind,int(ident),int(enabled),msg)
+        if data.startswith("confirm_delete:"):
+            _,kind,ident=data.split(":"); return self.confirm_delete_callback(user,chat,kind,int(ident),msg)
         if data=="backup": return self.send(chat,"<pre>"+safe_html(self.store.export_json())+"</pre>",self.back("tools"),msg)
         if data=="clear_audit": self.store.execute("DELETE FROM audit"); self.send(chat,"✅ گزارش پاک شد.",self.back("tools"),msg); return
         if data=="cancel": self.flows.pop(user,None); return self.home(chat,msg)
         self.send(chat,"❌ گزینه ناشناخته است.",self.back(),msg)
+    def toggle_choice(self, chat, kind, ident, edit=None):
+        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
+        if not row:
+            return self.send(chat, "❌ مورد انتخاب‌شده دیگر وجود ندارد.", self.back("accounts" if kind == "account" else "scenarios"), edit)
+        label = safe_html(row["name"])
+        keys = [[self.button("✅ روشن", f"confirm_toggle:{kind}:{ident}:1"), self.button("⏸ خاموش", f"confirm_toggle:{kind}:{ident}:0")], self.back("accounts" if kind == "account" else "scenarios")[0]]
+        self.send(chat, f"وضعیت مورد <b>{label}</b> را انتخاب کنید.", keys, edit)
+    def confirm_delete(self, chat, kind, ident, edit=None):
+        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
+        if not row:
+            return self.send(chat, "❌ مورد انتخاب‌شده پیدا نشد.", self.back("accounts" if kind == "account" else "scenarios"), edit)
+        keys = [[self.button("🗑 بله، حذف شود", f"confirm_delete:{kind}:{ident}"), self.button("لغو", "cancel")]]
+        self.send(chat, f"⚠️ حذف <b>{safe_html(row['name'])}</b> قطعی است؟", keys, edit)
+    def confirm_toggle_callback(self, user, chat, kind, ident, enabled, msg):
+        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
+        if not row: return self.send(chat, "❌ مورد پیدا نشد.", self.back("home"), msg)
+        if kind == "account":
+            self.store.set_account_enabled(ident, bool(enabled)); self.store.audit(user, "account-toggle", f"{ident}:{enabled}")
+            if enabled: self.hub.start(ident)
+            else: self.hub.stop(ident)
+        else:
+            self.store.set_scenario_enabled(ident, bool(enabled)); self.store.audit(user, "scenario-toggle", f"{ident}:{enabled}")
+            self.hub.start(row["account_id"])
+        self.send(chat, "✅ وضعیت با موفقیت تغییر کرد.", self.back("accounts" if kind == "account" else "scenarios"), msg)
+    def confirm_delete_callback(self, user, chat, kind, ident, msg):
+        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
+        if not row: return self.send(chat, "❌ مورد پیدا نشد.", self.back("home"), msg)
+        if kind == "account": self.hub.stop(ident); self.store.delete_account(ident)
+        else: self.store.delete_scenario(ident)
+        self.store.audit(user, "delete", f"{kind}:{ident}")
+        self.send(chat, "✅ حذف شد.", self.back("accounts" if kind == "account" else "scenarios"), msg)
     def special_commit(self,user,kind,v):
         if kind=="toggle_account":
             ident=int(v[0]); enabled=normalize(v[1]) in ("روشن","on","1","yes"); self.store.set_account_enabled(ident,enabled); self.store.audit(user,"account-toggle",f"{ident}:{enabled}"); (self.hub.start if enabled else self.hub.stop)(ident); return "✅ وضعیت حساب تغییر کرد."
@@ -516,6 +596,225 @@ class ManagerBot:
                     elif "message" in update: self.process_message(update["message"])
             except KeyboardInterrupt:return
             except Exception: log.exception("manager loop error"); time.sleep(3)
+
+
+
+class InputValidator:
+    @staticmethod
+    def account_name(value):
+        value=clean(value)
+        if not 2 <= len(value) <= 40: raise ValueError("نام حساب باید بین ۲ تا ۴۰ نویسه باشد")
+        if value.startswith("#"): raise ValueError("نام حساب نباید با # شروع شود")
+        return value
+    @staticmethod
+    def session(value):
+        value=clean(value)
+        if len(value) < 80: raise ValueError("Session کوتاه است؛ Session کامل Telethon را وارد کنید")
+        if not re.match(r"^[A-Za-z0-9_-]+=*$", value): raise ValueError("فرمت Session شامل نویسهٔ نامعتبر است")
+        return value
+    @staticmethod
+    def chat_id(value):
+        value=clean(value)
+        if not re.fullmatch(r"-?\d+", value): raise ValueError("chat_id باید عددی باشد، مثل -1001234567890")
+        return int(value)
+    @staticmethod
+    def keyword(value):
+        value=clean(value)
+        if not value or len(value)>200: raise ValueError("کلمه یا فرمان خالی/بیش از حد طولانی است")
+        return value
+    @staticmethod
+    def interval(value):
+        parsed=number(value)
+        if parsed>10080: raise ValueError("فاصله نمی‌تواند بیشتر از یک هفته باشد")
+        return parsed
+    @staticmethod
+    def timeout(value):
+        parsed=number(value,1)
+        if parsed>600: raise ValueError("timeout نمی‌تواند بیشتر از ۶۰۰ ثانیه باشد")
+        return parsed
+    @staticmethod
+    def switch(value):
+        value=normalize(value)
+        if value in {"روشن","on","1","yes","فعال"}: return True
+        if value in {"خاموش","off","0","no","غیرفعال"}: return False
+        raise ValueError("فقط روشن یا خاموش وارد کنید")
+
+
+class BackupService:
+    def __init__(self, store): self.store=store
+    def create(self):
+        payload=json.loads(self.store.export_json())
+        payload["database_path"]=DB_PATH
+        payload["account_count"]=self.store.account_count()
+        payload["scenario_count"]=self.store.scenario_count()
+        return json.dumps(payload,ensure_ascii=False,indent=2)
+    def redacted(self):
+        payload=json.loads(self.create())
+        for item in payload.get("accounts",[]): item.pop("session_blob",None)
+        return json.dumps(payload,ensure_ascii=False,indent=2)
+    def write(self,path):
+        with open(path,"w",encoding="utf-8") as handle: handle.write(self.create())
+        return path
+    def size(self):
+        return len(self.create().encode())
+    def checksum(self):
+        import hashlib
+        return hashlib.sha256(self.create().encode()).hexdigest()
+    def restore_guard(self,payload):
+        if not isinstance(payload,dict) or payload.get("version") not in {5,6}: raise ValueError("نسخهٔ پشتیبان ناشناخته است")
+        if "accounts" not in payload or "scenarios" not in payload: raise ValueError("پشتیبان ناقص است")
+        return True
+
+
+class RateLimiter:
+    def __init__(self, minimum=0.3): self.minimum=minimum; self.last={}; self.lock=threading.Lock()
+    def allowed(self,key):
+        now=time.monotonic()
+        with self.lock:
+            previous=self.last.get(key,0.0)
+            if now-previous<self.minimum: return False
+            self.last[key]=now; return True
+    def reset(self,key):
+        with self.lock: self.last.pop(key,None)
+    def clear(self):
+        with self.lock: self.last.clear()
+
+
+class WorkerHealth:
+    def __init__(self,hub,store): self.hub=hub; self.store=store
+    def account(self,ident):
+        row=self.store.account(ident)
+        if not row: return {"exists":False,"online":False}
+        return {"exists":True,"id":ident,"name":row["name"],"enabled":bool(row["enabled"]),"online":self.hub.online(ident),"status":row["last_status"],"error":row["last_error"]}
+    def all(self): return [self.account(row["id"]) for row in self.store.accounts()]
+    def online_count(self): return sum(item["online"] for item in self.all())
+    def errors(self): return [item for item in self.all() if item.get("error")]
+    def report(self): return {"workers":self.all(),"online":self.online_count(),"errors":len(self.errors()),"generated_at":utc_now()}
+
+
+class ScheduleMath:
+    @staticmethod
+    def period(minutes): return max(6.0,float(minutes)*60.0)
+    @staticmethod
+    def next_time(now,previous,minutes):
+        period=ScheduleMath.period(minutes); candidate=previous+period
+        while candidate<=now: candidate+=period
+        return candidate
+    @staticmethod
+    def delay(now,next_run): return max(0.1,next_run-now)
+    @staticmethod
+    def minute_label(value):
+        value=float(value)
+        if value.is_integer(): return f"{int(value)} دقیقه"
+        return f"{value:g} دقیقه"
+    @staticmethod
+    def seconds_label(value):
+        value=float(value)
+        if value.is_integer(): return f"{int(value)} ثانیه"
+        return f"{value:g} ثانیه"
+
+
+class AuditService:
+    def __init__(self,store): self.store=store
+    def record(self,admin,action,details=""): self.store.audit(admin,action,clean(details))
+    def recent(self,limit=20): return [dict(row) for row in self.store.recent_audit(limit)]
+    def by_admin(self,admin,limit=50): return [dict(row) for row in self.store.all("SELECT * FROM audit WHERE admin_id=? ORDER BY id DESC LIMIT ?",(admin,limit))]
+    def count(self): return int(self.store.one("SELECT COUNT(*) FROM audit")[0])
+    def clear(self): self.store.execute("DELETE FROM audit")
+    def export_text(self,limit=100): return "\\n".join(f"{row['created_at']} | {row['admin_id']} | {row['action']} | {row['details']}" for row in self.store.recent_audit(limit))
+
+
+class PanelCatalog:
+    ITEMS={
+        "accounts":"مدیریت حساب‌های Session", "scenarios":"مدیریت سناریوهای مستقل", "test_manager":"تست اتصال Bot API",
+        "test_worker":"تست اتصال Worker", "backup":"پشتیبان‌گیری تنظیمات", "clear_audit":"پاک‌سازی گزارش",
+        "set_poll":"تنظیم polling", "set_timeout":"تنظیم timeout", "edit_account":"ویرایش حساب",
+        "delete_account":"حذف حساب", "toggle_account":"فعال‌سازی حساب", "edit_scenario":"ویرایش سناریو",
+        "delete_scenario":"حذف سناریو", "toggle_scenario":"فعال‌سازی سناریو", "help":"راهنمای استفاده"
+    }
+    @classmethod
+    def label(cls,key): return cls.ITEMS.get(key,"گزینهٔ ناشناخته")
+    @classmethod
+    def keys(cls): return tuple(cls.ITEMS)
+    @classmethod
+    def search(cls,term):
+        term=normalize(term); return {key:value for key,value in cls.ITEMS.items() if term in normalize(value) or term in normalize(key)}
+    @classmethod
+    def as_text(cls): return "\\n".join(f"{key}: {value}" for key,value in cls.ITEMS.items())
+
+
+class RuntimeGuard:
+    def __init__(self): self.started=time.monotonic(); self.stop_event=threading.Event()
+    def uptime(self): return time.monotonic()-self.started
+    def request_stop(self): self.stop_event.set()
+    def stopping(self): return self.stop_event.is_set()
+    def wait(self,seconds): return self.stop_event.wait(seconds)
+    def reset(self): self.stop_event.clear(); self.started=time.monotonic()
+
+
+class ScenarioService:
+    def __init__(self,store,hub): self.store=store; self.hub=hub
+    def validate_links(self,account_id,chat_id):
+        if not self.store.account(account_id): raise ValueError("حساب انتخاب‌شده وجود ندارد")
+        if not isinstance(chat_id,int): raise ValueError("chat_id عددی نیست")
+        return True
+    def create(self,name,account_id,chat_id,keyword,button,minutes,timeout):
+        name=clean(name); keyword=InputValidator.keyword(keyword); minutes=InputValidator.interval(str(minutes)); timeout=InputValidator.timeout(str(timeout)); self.validate_links(account_id,chat_id)
+        return self.store.create_scenario(name,account_id,chat_id,keyword,clean(button),minutes,timeout)
+    def enable(self,ident):
+        row=self.store.scenario(ident)
+        if not row: raise ValueError("سناریو وجود ندارد")
+        account=self.store.account(row["account_id"])
+        if not account: raise ValueError("حساب سناریو وجود ندارد")
+        if not account["enabled"]: raise ValueError("ابتدا حساب را روشن کنید")
+        self.store.set_scenario_enabled(ident,True); self.hub.start(account["id"]); return True
+    def disable(self,ident):
+        if not self.store.scenario(ident): raise ValueError("سناریو وجود ندارد")
+        self.store.set_scenario_enabled(ident,False); return True
+    def independent(self):
+        return [{"id":row["id"],"account":row["account_id"],"chat":row["chat_id"],"period":ScheduleMath.period(row["interval_minutes"])} for row in self.store.scenarios()]
+
+
+
+class SessionInspector:
+    def __init__(self, store): self.store=store
+    def inspect(self, ident):
+        row=self.store.account(ident)
+        if not row: return {"ok":False,"reason":"account-not-found"}
+        try:
+            raw=CRYPTO.decrypt(row["session_blob"].encode()).decode()
+            if len(raw)<80: return {"ok":False,"reason":"session-too-short","account":row["name"]}
+            return {"ok":True,"account":row["name"],"length":len(raw),"preview":secret_preview(raw),"enabled":bool(row["enabled"])}
+        except InvalidToken: return {"ok":False,"reason":"decrypt-failed","account":row["name"]}
+    def all(self): return [self.inspect(row["id"]) for row in self.store.accounts()]
+    def valid_count(self): return sum(1 for item in self.all() if item.get("ok"))
+    def invalid_count(self): return sum(1 for item in self.all() if not item.get("ok"))
+    def redact(self,item):
+        result=dict(item); result.pop("preview",None); return result
+    def safe_report(self): return [self.redact(item) for item in self.all()]
+
+
+class ConfigPolicy:
+    MAX_ACCOUNTS=50
+    MAX_SCENARIOS=500
+    MIN_INTERVAL=0.1
+    MAX_INTERVAL=10080.0
+    def check_account_limit(self,store):
+        if store.account_count()>=self.MAX_ACCOUNTS: raise ValueError("تعداد حساب‌ها به سقف مجاز رسیده است")
+        return True
+    def check_scenario_limit(self,store):
+        if store.scenario_count()>=self.MAX_SCENARIOS: raise ValueError("تعداد سناریوها به سقف مجاز رسیده است")
+        return True
+    def check_interval(self,value):
+        value=float(value)
+        if not self.MIN_INTERVAL<=value<=self.MAX_INTERVAL: raise ValueError("فاصلهٔ سناریو خارج از محدوده است")
+        return value
+    def check_timeout(self,value):
+        value=float(value)
+        if not 1<=value<=600: raise ValueError("timeout خارج از محدوده است")
+        return value
+    def check_name(self,value):
+        return InputValidator.account_name(value)
 
 
 def main(): ManagerBot().run()
