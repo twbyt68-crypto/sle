@@ -44,7 +44,7 @@ STORAGE_TAG = "MINE_USERBOT_CONFIG_V3"
 SESSION_FILE = "mine_session.txt"
 MAX_RECENT_MESSAGES = 50
 POLL_INTERVAL = 0.5
-DEFAULT_INTERVAL = 180
+DEFAULT_INTERVAL_MINUTES = 3.0
 DEFAULT_TIMEOUT = 15
 DEFAULT_KEYWORD = "ماین"
 DEFAULT_BUTTON = "بفروش بره"
@@ -99,7 +99,7 @@ class Scenario:
     chats: list[int] = field(default_factory=list)
     keyword: str = DEFAULT_KEYWORD
     button: str = DEFAULT_BUTTON
-    interval: int = DEFAULT_INTERVAL
+    interval_minutes: float = DEFAULT_INTERVAL_MINUTES
     timeout: int = DEFAULT_TIMEOUT
     enabled: bool = False
 
@@ -110,7 +110,8 @@ class Scenario:
             chats=[int(x) for x in raw.get("chats", [])],
             keyword=str(raw.get("keyword", DEFAULT_KEYWORD)),
             button=str(raw.get("button", "")),
-            interval=max(1, int(raw.get("interval", DEFAULT_INTERVAL))),
+            # Backward compatibility: old configs stored interval in seconds.
+            interval_minutes=max(0.1, float(raw.get("interval_minutes", float(raw.get("interval", DEFAULT_INTERVAL_MINUTES * 60)) / 60))),
             timeout=max(1, int(raw.get("timeout", DEFAULT_TIMEOUT))),
             enabled=bool(raw.get("enabled", False)),
         )
@@ -122,7 +123,7 @@ class Config:
         self.storage_msg_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"scenarios": {name: asdict(s) for name, s in self.scenarios.items()}}
+        return {"version": 4, "scenarios": {name: asdict(s) for name, s in self.scenarios.items()}}
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Config":
@@ -141,6 +142,7 @@ class MineUserbot:
         self.config = Config()
         self.tasks: dict[tuple[str, int], asyncio.Task] = {}
         self.locks: dict[tuple[str, int], asyncio.Lock] = {}
+        self.next_runs: dict[tuple[str, int], float] = {}
         self.config_lock = asyncio.Lock()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -232,21 +234,21 @@ class MineUserbot:
 • .ماین خاموش      توقف در گروه فعلی
 • .ماین وضعیت      نمایش وضعیت
 • .ماین تست        تست دکمه در گروه فعلی
-• .ماین زمان 3:50M   سه دقیقه و پنجاه ثانیه
-• .ماین زمان 2:30H   دو ساعت و سی دقیقه
+• .ماین زمان 3:50M   تنظیم سازگار با نسخهٔ قدیمی؛ ۳ دقیقه و ۵۰ ثانیه
+• .ماین زمان 2:30H   تنظیم سازگار با نسخهٔ قدیمی؛ ۲ ساعت و ۳۰ دقیقه
 • .کلمه متن        تغییر کلمهٔ سناریوی پیش‌فرض
 • .دکمه متن        تغییر دکمهٔ سناریوی پیش‌فرض
 
 مدیریت سناریوهای مستقل:
 • .سناریو افزودن نام
-• .سناریو تنظیم نام | کلمه | دکمه | فاصله‌ثانیه | chat_id
+• .سناریو تنظیم نام | کلمه | دکمه | فاصله‌دقیقه | chat_id
 • .سناریو روشن نام
 • .سناریو خاموش نام
 • .سناریو حذف نام
 • .سناریوها
 
-برای حالت بدون دکمه، ستون دکمه را خالی بگذارید:
-.سناریو تنظیم فقط-ارسال | /start |  | 60 | -1001234567890
+فاصلهٔ همهٔ سناریوها برحسب دقیقه است؛ اعشار هم مجاز است، مثل `0.5` دقیقه. برای حالت بدون دکمه، ستون دکمه را خالی بگذارید:
+.سناریو تنظیم فقط-ارسال | /start |  | 1 | -1001234567890
 
 تنظیمات در Saved Messages ذخیره می‌شود."""
 
@@ -280,7 +282,7 @@ class MineUserbot:
             await self.save_config()
             return f"✅ سناریو حذف شد: {name}"
 
-        match = re.fullmatch(r"\.سناریو تنظیم\s+(.+?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(\d+)\s*\|\s*(-?\d+)", text)
+        match = re.fullmatch(r"\.سناریو تنظیم\s+(.+?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(\d+(?:[.,]\d+)?)\s*\|\s*(-?\d+)", text)
         if match:
             name, keyword, button, interval, target_chat = match.groups()
             if name not in self.config.scenarios:
@@ -288,11 +290,11 @@ class MineUserbot:
             scenario = self.config.scenarios[name]
             scenario.keyword = keyword or DEFAULT_KEYWORD
             scenario.button = button
-            scenario.interval = max(1, int(interval))
+            scenario.interval_minutes = max(0.1, float(interval.replace(",", ".")))
             if int(target_chat) not in scenario.chats:
                 scenario.chats.append(int(target_chat))
             await self.save_config()
-            return f"✅ تنظیم شد: {name}\nکلمه: {scenario.keyword}\nدکمه: {scenario.button or 'بدون دکمه'}\nفاصله: {scenario.interval} ثانیه\nگروه: {target_chat}"
+            return f"✅ تنظیم شد: {name}\nکلمه: {scenario.keyword}\nدکمه: {scenario.button or 'بدون دکمه'}\nفاصله: {scenario.interval_minutes:g} دقیقه\nگروه: {target_chat}"
 
         match = re.fullmatch(r"\.سناریو (روشن|خاموش)\s+(.+)", text)
         if match:
@@ -333,10 +335,10 @@ class MineUserbot:
             seconds = parse_duration(match.group(1), match.group(2))
             if not seconds:
                 return "❌ زمان نامعتبر است. نمونه: .ماین زمان 3:50M"
-            default.interval = seconds
+            default.interval_minutes = seconds / 60
             await self.save_config()
             self.restart_enabled()
-            return f"✅ فاصلهٔ Mine روی {seconds} ثانیه تنظیم شد."
+            return f"✅ فاصلهٔ Mine روی {default.interval_minutes:g} دقیقه تنظیم شد."
         match = re.fullmatch(r"\.کلمه\s+(.+)", text)
         if match:
             default.keyword = match.group(1).strip()
@@ -354,12 +356,12 @@ class MineUserbot:
             return "هیچ سناریویی ثبت نشده است."
         lines = ["📋 سناریوها:"]
         for s in self.config.scenarios.values():
-            lines.append(f"• {s.name} | {'روشن' if s.enabled else 'خاموش'} | کلمه={s.keyword} | دکمه={s.button or 'ندارد'} | فاصله={s.interval}s | chats={s.chats}")
+            lines.append(f"• {s.name} | {'روشن' if s.enabled else 'خاموش'} | کلمه={s.keyword} | دکمه={s.button or 'ندارد'} | فاصله={s.interval_minutes:g} دقیقه | chats={s.chats}")
         return "\n".join(lines)
 
     def status_text(self) -> str:
         default = self.default_scenario()
-        return f"📊 وضعیت Mine\nکلمه: {default.keyword}\nدکمه: {default.button or 'بدون دکمه'}\nفاصله: {default.interval} ثانیه\nگروه‌ها: {default.chats or 'هیچ'}\nفعال: {'بله' if default.enabled else 'خیر'}"
+        return f"📊 وضعیت Mine\nکلمه: {default.keyword}\nدکمه: {default.button or 'بدون دکمه'}\nفاصله: {default.interval_minutes:g} دقیقه\nگروه‌ها: {default.chats or 'هیچ'}\nفعال: {'بله' if default.enabled else 'خیر'}"
 
     async def test_default(self, chat_id: int) -> str:
         scenario = self.default_scenario()
@@ -385,7 +387,9 @@ class MineUserbot:
                 self.tasks[key] = asyncio.create_task(self.scheduler(scenario, chat_id))
 
     def stop_pair(self, name: str, chat_id: int) -> None:
-        task = self.tasks.pop((name, chat_id), None)
+        key = (name, chat_id)
+        task = self.tasks.pop(key, None)
+        self.next_runs.pop(key, None)
         if task and not task.done():
             task.cancel()
 
@@ -416,7 +420,15 @@ class MineUserbot:
                 break
             except Exception:
                 log.exception("Scenario failed: %s/%s", scenario.name, chat_id)
-            await asyncio.sleep(max(0.1, scenario.interval - (time.monotonic() - started)))
+            # Keep a stable monotonic timetable per task. If polling takes time,
+            # skip missed slots instead of firing several late executions together.
+            period = scenario.interval_minutes * 60.0
+            key = (scenario.name, chat_id)
+            next_run = self.next_runs.get(key, started + period)
+            while next_run <= time.monotonic():
+                next_run += period
+            self.next_runs[key] = next_run
+            await asyncio.sleep(max(0.1, next_run - time.monotonic()))
 
     async def execute_once(self, scenario: Scenario, chat_id: int) -> None:
         assert self.client
