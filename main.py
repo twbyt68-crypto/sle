@@ -1,1014 +1,589 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Central Telegram control plane with real Telethon Session workers.
-
-The Telegram Bot API process is a button-based administration panel. Every
-operational account is an independent Telethon client. The panel never sends a
-text command to a target group: it writes a scenario into SQLite, and the
-corresponding worker reads it and performs the configured action.
 """
-from __future__ import annotations
+Telegram Userbot — Mine Auto-Clicker
+Works on Local and Railway
+
+    pip install telethon
+    python main.py
+"""
 
 import asyncio
-import html
-import unicodedata
-import io
 import json
-import logging
 import os
 import re
-import sqlite3
-import threading
 import time
-import traceback
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Iterable
+import unicodedata
+import logging
 
-import requests
-from cryptography.fernet import Fernet, InvalidToken
-from telethon import TelegramClient
-from telethon.errors import (ChatWriteForbiddenError, FloodWaitError,
-                             MessageNotModifiedError, SessionPasswordNeededError,
-                             UserNotParticipantError)
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import (
+    FloodWaitError,
+    ChatWriteForbiddenError,
+    UserNotParticipantError,
+    MessageNotModifiedError,
+    SessionPasswordNeededError,
+)
+
 try:
     from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 except ImportError:
     GetBotCallbackAnswerRequest = None
 
-RELEASE_VERSION = "2026.08.25.10"
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("telegram-control-plane")
-
-MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN", "").strip()
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "").strip()
-FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
-DB_PATH = os.getenv("DB_PATH", "manager.sqlite3")
-POLL_INTERVAL = max(0.1, float(os.getenv("POLL_INTERVAL", "0.5")))
-USE_BUTTON_STYLES = os.getenv("USE_BUTTON_STYLES", "true").lower() in {"1", "true", "yes", "on"}
-STYLE_PRIMARY = "primary"
-STYLE_SUCCESS = "success"
-STYLE_DANGER = "danger"
-VALID_STYLES = {STYLE_PRIMARY, STYLE_SUCCESS, STYLE_DANGER}
-RECENT_MESSAGES = 50
-DEFAULT_INTERVAL_MINUTES = 3.0
-DEFAULT_TIMEOUT_SECONDS = 15.0
-if not MANAGER_BOT_TOKEN or not ADMIN_IDS or not API_ID or not API_HASH or not FERNET_KEY:
-    raise RuntimeError("MANAGER_BOT_TOKEN, ADMIN_IDS, API_ID, API_HASH and FERNET_KEY are required")
 try:
-    CRYPTO = Fernet(FERNET_KEY.encode())
-except Exception as exc:
-    raise RuntimeError("FERNET_KEY is not a valid Fernet key") from exc
+    from telethon.tl.types import ReplyInlineMarkup
+except ImportError:
+    ReplyInlineMarkup = None
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# ═══════════════════════════════════════════════════════════════════════════
+#  ENVIRONMENT / CREDENTIALS
+# ═══════════════════════════════════════════════════════════════════════════
+
+API_ID       = int(os.environ.get("API_ID", "21052750"))
+API_HASH     = os.environ.get("API_HASH", "857cc5ccbb70a2e67294d038b1000805")
+PHONE        = os.environ.get("PHONE", "+989211390758")
+SESSION_STR  = os.environ.get("SESSION_STRING", "")
+SESSION_FILE = "mine_session.txt"
 
 
-def clean(value: Any) -> str:
-    value = "" if value is None else str(value)
-    value = value.replace("\x00", "")
-    return re.sub(r"\s+", " ", value).strip()
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+STORAGE_TAG      = "⚙️ MINE_USERBOT_CONFIG_V1"
+DEFAULT_BUTTON   = "بفروش بره"
+SEARCH_LIMIT     = 50
+DEFAULT_KEYWORD  = "ماین"
+DEFAULT_INTERVAL = 180
+CLICK_RETRIES    = 120
+CLICK_WAIT       = 0.5
+VERSION          = "direct-userbot-2026.08.25"
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("mine-direct-userbot")
 
 
-def normalize(value: Any) -> str:
-    text=clean(value).casefold()
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Config:
+
+    def __init__(self):
+        self.interval       = DEFAULT_INTERVAL
+        self.time_format    = "M"
+        self.keyword        = DEFAULT_KEYWORD
+        self.button_text    = DEFAULT_BUTTON
+        self.active_chats   = []
+        self.storage_msg_id = None
+
+    def to_dict(self):
+        return {
+            "interval":     self.interval,
+            "time_format":  self.time_format,
+            "keyword":      self.keyword,
+            "button_text":  self.button_text,
+            "active_chats": self.active_chats,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        c = cls()
+        c.interval     = d.get("interval", DEFAULT_INTERVAL)
+        c.time_format  = d.get("time_format", "M")
+        c.keyword      = d.get("keyword", DEFAULT_KEYWORD)
+        c.button_text  = d.get("button_text", DEFAULT_BUTTON)
+        c.active_chats = d.get("active_chats", [])
+        return c
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TEXT NORMALIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def normalize(text):
+    """Normalize Persian/Arabic button labels and remove decorative glyphs."""
+    text=unicodedata.normalize("NFKC", str(text or "")).casefold()
     text=text.translate(str.maketrans({"ي":"ی","ى":"ی","ك":"ک","ۀ":"ه","ة":"ه","ؤ":"و","إ":"ا","أ":"ا","ـ":""}))
-    text=text.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
-    text="".join(ch for ch in text if unicodedata.category(ch) not in {"Cf", "So", "Sk"})
-    text=re.sub(r"[\u2000-\u206f\u2e00-\u2e7f\u3000-\u303f]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text=text.replace("\u200c","").replace("\u200d","").replace("\ufeff","")
+    text="".join(ch for ch in text if unicodedata.category(ch) not in {"Cf","So","Sk"})
+    return re.sub(r"\s+"," ",text).strip()
 
 
-def text_candidates(value: Any) -> list[str]:
-    raw=clean(value); variants=[raw]
-    for separator in ("|", "•", "—", "-", "✅", "🔘"):
-        variants.extend(part.strip() for part in raw.split(separator) if part.strip())
-    return list(dict.fromkeys(variants))
-
-
-def button_matches(value: Any, target: Any) -> bool:
-    right=normalize(target)
-    if not right: return False
-    for candidate in text_candidates(value):
-        left=normalize(candidate)
-        if left and (left==right or left in right or right in left): return True
+def button_matches(btn_text, target):
+    """Check if button text matches target (flexible matching)."""
+    a = normalize(btn_text)
+    b = normalize(target)
+    if a == b:
+        return True
+    if b in a or a in b:
+        return True
     return False
 
 
-def button_label(button: Any) -> str:
-    for attribute in ("text", "label", "title"):
-        value=getattr(button,attribute,None)
-        if value: return str(value)
-    return ""
+# ═══════════════════════════════════════════════════════════════════════════
+#  USERBOT
+# ═══════════════════════════════════════════════════════════════════════════
 
+class MineUserbot:
 
-def number(value: str, minimum: float = 0.1) -> float:
-    parsed = float(clean(value).replace(",", "."))
-    if parsed < minimum:
-        raise ValueError(f"value must be >= {minimum}")
-    return parsed
+    def __init__(self):
+        self.client    = None
+        self.config    = Config()
+        self.tasks     = {}
+        self.owner     = 0
+        self._cfg_lock = asyncio.Lock()
 
-
-def parse_duration_minutes(value: str, unit: str = "minutes") -> float:
-    text=clean(value).casefold().replace("،", ",").replace(",", ".")
-    if not text: raise ValueError("زمان خالی است")
-    aliases={"دقیقه":"minutes","دقیقه‌ای":"minutes","m":"minutes","min":"minutes","mins":"minutes","ساعت":"hours","ساعته":"hours","h":"hours","hr":"hours","ثانیه":"seconds","ثانیه‌ای":"seconds","s":"seconds","sec":"seconds"}
-    for suffix, normalized in aliases.items():
-        if text.endswith(suffix): unit=normalized; text=text[:-len(suffix)].strip(); break
-    if ":" in text:
-        parts=text.split(":")
-        if len(parts)==2:
-            major,minor=parts
-            if not major.isdigit() or not re.fullmatch(r"\d{1,2}",minor): raise ValueError("قالب زمان باید مثل 3:05 باشد")
-            if int(minor)>=60: raise ValueError("ثانیه/دقیقهٔ بخش دوم باید کمتر از 60 باشد")
-            seconds=int(major)*60+int(minor); return seconds/60
-        if len(parts)==3:
-            h,m,s=parts
-            if not all(re.fullmatch(r"\d+",x) for x in parts) or int(m)>=60 or int(s)>=60: raise ValueError("قالب زمان باید مثل 1:03:05 باشد")
-            return (int(h)*3600+int(m)*60+int(s))/60
-        raise ValueError("قالب زمان نامعتبر است")
-    parsed=float(text)
-    factors={"minutes":1.0,"hours":60.0,"seconds":1/60}
-    if unit not in factors: raise ValueError("واحد زمان باید ساعت، دقیقه یا ثانیه باشد")
-    result=parsed*factors[unit]
-    if result<=0: raise ValueError("زمان باید بیشتر از صفر باشد")
-    return result
-
-
-def parse_duration_seconds(value: str) -> float:
-    text=clean(value)
-    if ":" in text: return parse_duration_minutes(text)*60
-    return parse_duration_minutes(text,"seconds")*60
-
-
-def parse_scenario_values(values: list[str], meta: dict[str, Any] | None = None):
-    values=[clean(item) for item in values]; meta=meta or {}
-    if len(values)==6 and meta.get("account_id") is not None:
-        name,chat_id,keyword,button,interval,timeout=values
-        return name,int(chat_id),keyword,button,parse_duration_minutes(interval),parse_duration_seconds(timeout),int(meta["account_id"])
-    if len(values)>=7:
-        if re.fullmatch(r"-?\d+",values[1]) and re.fullmatch(r"-?\d+",values[2]):
-            name,account_id,chat_id,keyword,button,interval,timeout=values[:7]
-            return name,int(chat_id),keyword,button,parse_duration_minutes(interval),parse_duration_seconds(timeout),int(account_id)
-        numeric=[index for index,item in enumerate(values) if re.fullmatch(r"-?\d+",item) and (item.startswith("-") or item.startswith("-100"))]
-        if numeric:
-            chat_index=numeric[0]; name=values[0]; chat_id=int(values[chat_index]); keyword=values[1]; button=values[2] if len(values)>2 else ""; interval=values[3] if len(values)>3 else "3"; timeout=values[4] if len(values)>4 else "15"
-            return name,chat_id,keyword,button,parse_duration_minutes(interval),parse_duration_seconds(timeout),int(meta.get("account_id",0))
-    raise ValueError("ترتیب مراحل سناریو نامعتبر است؛ از مسیر جدید افزودن سناریو دوباره شروع کنید")
-
-
-def safe_html(value: Any) -> str:
-    return html.escape(clean(value))
-
-
-def secret_preview(value: str) -> str:
-    if not value:
-        return "خالی"
-    return value[:3] + "…" + value[-3:]
-
-
-class Store:
-    def __init__(self, path: str = DB_PATH):
-        self.path = path
-        self.lock = threading.RLock()
-        self.db = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript("""
-        CREATE TABLE IF NOT EXISTS accounts(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            session_blob TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            last_status TEXT NOT NULL DEFAULT 'new',
-            last_error TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS scenarios(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            account_id INTEGER NOT NULL,
-            chat_id INTEGER NOT NULL,
-            keyword TEXT NOT NULL,
-            button TEXT NOT NULL DEFAULT '',
-            interval_minutes REAL NOT NULL DEFAULT 3,
-            timeout_seconds REAL NOT NULL DEFAULT 15,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            last_run TEXT NOT NULL DEFAULT '',
-            last_result TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS audit(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            details TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_scenarios_account ON scenarios(account_id);
-        CREATE INDEX IF NOT EXISTS idx_scenarios_enabled ON scenarios(enabled);
-        """)
-        self.db.commit()
-
-    def execute(self, sql: str, params: tuple = ()):
-        with self.lock:
-            cursor = self.db.execute(sql, params)
-            self.db.commit()
-            return cursor
-
-    def one(self, sql: str, params: tuple = ()):
-        with self.lock:
-            return self.db.execute(sql, params).fetchone()
-
-    def all(self, sql: str, params: tuple = ()):
-        with self.lock:
-            return self.db.execute(sql, params).fetchall()
-
-    def audit(self, admin: int, action: str, details: str = ""):
-        self.execute("INSERT INTO audit(admin_id,action,details,created_at) VALUES(?,?,?,?)", (admin, action, details, utc_now()))
-
-    def setting(self, key: str, default: str = "") -> str:
-        row = self.one("SELECT value FROM settings WHERE key=?", (key,))
-        return row[0] if row else default
-
-    def set_setting(self, key: str, value: str):
-        self.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
-
-    def accounts(self): return self.all("SELECT * FROM accounts ORDER BY id DESC")
-    def scenarios(self): return self.all("SELECT s.*,a.name account_name FROM scenarios s JOIN accounts a ON a.id=s.account_id ORDER BY s.id DESC")
-    def counts(self) -> dict[str, int]:
-        return {"accounts": self.one("SELECT COUNT(*) FROM accounts")[0], "scenarios": self.one("SELECT COUNT(*) FROM scenarios")[0], "enabled": self.one("SELECT COUNT(*) FROM scenarios WHERE enabled=1")[0]}
-    def account_names(self) -> list[str]:
-        return [row["name"] for row in self.accounts()]
-    def scenario_names(self) -> list[str]:
-        return [row["name"] for row in self.scenarios()]
-    def close(self):
-        with self.lock: self.db.close()
-    def account_count(self) -> int:
-        return int(self.one("SELECT COUNT(*) FROM accounts")[0])
-    def scenario_count(self) -> int:
-        return int(self.one("SELECT COUNT(*) FROM scenarios")[0])
-    def enabled_scenario_count(self) -> int:
-        return int(self.one("SELECT COUNT(*) FROM scenarios WHERE enabled=1")[0])
-    def recent_audit(self, limit: int = 20):
-        return self.all("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (max(1, min(100, limit)),))
-    def account(self, ident: int): return self.one("SELECT * FROM accounts WHERE id=?", (ident,))
-    def scenario(self, ident: int): return self.one("SELECT * FROM scenarios WHERE id=?", (ident,))
-
-    def create_account(self, name: str, session: str) -> int:
-        now = utc_now(); blob = CRYPTO.encrypt(session.encode()).decode()
-        return self.execute("INSERT INTO accounts(name,session_blob,created_at,updated_at) VALUES(?,?,?,?)", (name, blob, now, now)).lastrowid
-
-    def update_account(self, ident: int, name: str, session: str | None = None):
-        if session:
-            blob = CRYPTO.encrypt(session.encode()).decode()
-            self.execute("UPDATE accounts SET name=?,session_blob=?,updated_at=? WHERE id=?", (name, blob, utc_now(), ident))
-        else:
-            self.execute("UPDATE accounts SET name=?,updated_at=? WHERE id=?", (name, utc_now(), ident))
-
-    def set_account_enabled(self, ident: int, enabled: bool):
-        self.execute("UPDATE accounts SET enabled=?,updated_at=? WHERE id=?", (int(enabled), utc_now(), ident))
-
-    def set_account_status(self, ident: int, status: str, error: str = ""):
-        self.execute("UPDATE accounts SET last_status=?,last_error=?,updated_at=? WHERE id=?", (status, error[:1000], utc_now(), ident))
-
-    def delete_account(self, ident: int): self.execute("DELETE FROM accounts WHERE id=?", (ident,))
-
-    def create_scenario(self, name: str, account_id: int, chat_id: int, keyword: str, button: str, minutes: float, timeout: float) -> int:
-        now = utc_now()
-        return self.execute("INSERT INTO scenarios(name,account_id,chat_id,keyword,button,interval_minutes,timeout_seconds,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (name, account_id, chat_id, keyword, button, minutes, timeout, now, now)).lastrowid
-
-    def update_scenario(self, ident: int, name: str, account_id: int, chat_id: int, keyword: str, button: str, minutes: float, timeout: float):
-        self.execute("UPDATE scenarios SET name=?,account_id=?,chat_id=?,keyword=?,button=?,interval_minutes=?,timeout_seconds=?,updated_at=? WHERE id=?", (name, account_id, chat_id, keyword, button, minutes, timeout, utc_now(), ident))
-
-    def set_scenario_enabled(self, ident: int, enabled: bool): self.execute("UPDATE scenarios SET enabled=?,updated_at=? WHERE id=?", (int(enabled), utc_now(), ident))
-    def delete_scenario(self, ident: int): self.execute("DELETE FROM scenarios WHERE id=?", (ident,))
-    def mark_scenario(self, ident: int, result: str): self.execute("UPDATE scenarios SET last_run=?,last_result=?,updated_at=? WHERE id=?", (utc_now(), result[:500], utc_now(), ident))
-
-    def export_json(self) -> str:
-        data = {"version": 5, "exported_at": utc_now(), "accounts": [], "scenarios": [], "settings": {}}
-        for row in self.accounts():
-            data["accounts"].append({"id": row["id"], "name": row["name"], "enabled": bool(row["enabled"]), "last_status": row["last_status"], "created_at": row["created_at"]})
-        for row in self.scenarios(): data["scenarios"].append(dict(row))
-        for row in self.all("SELECT key,value FROM settings"): data["settings"][row["key"]] = row["value"]
-        return json.dumps(data, ensure_ascii=False, indent=2)
-
-
-class UserWorker:
-    def __init__(self, account: sqlite3.Row, store: Store):
-        self.account = account; self.store = store; self.client: TelegramClient | None = None
-        self.tasks: dict[int, asyncio.Task] = {}; self.next_runs: dict[int, float] = {}
-        self.stop_flag = False
-
-    def session_string(self) -> str:
-        try: return CRYPTO.decrypt(self.account["session_blob"].encode()).decode()
-        except InvalidToken as exc: raise RuntimeError("encrypted Session cannot be decrypted") from exc
-
-    async def connect(self):
-        self.client = TelegramClient(StringSession(self.session_string()), API_ID, API_HASH, request_retries=5, connection_retries=5, auto_reconnect=True, sequential_updates=False)
-        await self.client.connect()
-        if not await self.client.is_user_authorized(): raise RuntimeError("Session is not authorized")
+    # ── entry ────────────────────────────────────────────────
 
     async def run(self):
-        try:
-            await self.connect(); self.store.set_account_status(self.account["id"], "online")
-            while not self.stop_flag:
-                self.sync_tasks(); await asyncio.sleep(2)
-        except asyncio.CancelledError: pass
-        except Exception as exc:
-            self.store.set_account_status(self.account["id"], "error", str(exc)); log.exception("worker %s stopped", self.account["name"])
-        finally:
-            if self.client: await self.client.disconnect()
+        await self._init_client()
+        await self._load_config()
+        self._register_handlers()
+        self._start_all()
+        await self.client.run_until_disconnected()
 
-    def sync_tasks(self):
-        active = {row["id"]: row for row in self.store.all("SELECT * FROM scenarios WHERE account_id=? AND enabled=1", (self.account["id"],))}
-        for ident, task in list(self.tasks.items()):
-            if ident not in active: task.cancel(); self.tasks.pop(ident, None); self.next_runs.pop(ident, None)
-        for ident, row in active.items():
-            if ident not in self.tasks or self.tasks[ident].done(): self.tasks[ident] = asyncio.create_task(self.schedule(row))
+    # ── client init ──────────────────────────────────────────
 
-    async def schedule(self, row: sqlite3.Row):
-        ident = row["id"]; period = max(6.0, float(row["interval_minutes"]) * 60); next_run = time.monotonic()
-        while not self.stop_flag:
+    async def _init_client(self):
+        api_id   = API_ID   or int(input("API ID: "))
+        api_hash = API_HASH or input("API Hash: ")
+
+        if SESSION_STR:
+            session = StringSession(SESSION_STR)
+        elif os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "r") as f:
+                saved = f.read().strip()
+            session = StringSession(saved) if saved else StringSession()
+        else:
+            session = StringSession()
+
+        self.client = TelegramClient(session, api_id, api_hash)
+        await self.client.connect()
+
+        if not await self.client.is_user_authorized():
+            phone = PHONE or input("Phone (e.g. +989...): ")
+            await self.client.send_code_request(phone)
+            code = input("Verification code: ")
             try:
-                await self.execute_once(row)
-            except asyncio.CancelledError: return
-            except FloodWaitError as exc:
-                self.store.mark_scenario(ident, f"FloodWait {exc.seconds}s"); await asyncio.sleep(exc.seconds + 1)
-            except (ChatWriteForbiddenError, UserNotParticipantError) as exc:
-                self.store.mark_scenario(ident, f"access error: {type(exc).__name__}"); return
-            except Exception as exc:
-                self.store.mark_scenario(ident, f"error: {type(exc).__name__}: {exc}")
-            next_run += period
-            while next_run <= time.monotonic(): next_run += period
-            self.next_runs[ident] = next_run
-            await asyncio.sleep(max(0.1, next_run - time.monotonic()))
+                await self.client.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                pwd = input("2FA Password: ")
+                await self.client.sign_in(password=pwd)
+            try:
+                ss = session.save()
+                with open(SESSION_FILE, "w") as f:
+                    f.write(ss)
+            except Exception:
+                pass
 
-    async def execute_once(self, row: sqlite3.Row) -> bool:
-        assert self.client
-        sent=await self.client.send_message(int(row["chat_id"]), row["keyword"])
-        if not row["button"]: self.store.mark_scenario(row["id"], "sent-no-button"); return True
-        attempts = max(1, int(float(row["timeout_seconds"]) / POLL_INTERVAL))
-        for _ in range(attempts):
-            await asyncio.sleep(POLL_INTERVAL)
-            if await self.find_and_click(int(row["chat_id"]), row["button"], min_id=getattr(sent,"id",None)):
-                self.store.mark_scenario(row["id"], "clicked"); return True
-        self.store.mark_scenario(row["id"], "button-not-found"); return False
+        self.owner = (await self.client.get_me()).id
 
-    async def find_and_click(self, chat_id: int, target: str, min_id: int | None = None) -> bool:
-        assert self.client
+    # ── storage (Saved Messages) ─────────────────────────────
+
+    async def _load_config(self):
+        try:
+            async for m in self.client.iter_messages("me", limit=50):
+                if m.text and STORAGE_TAG in m.text:
+                    match = re.search(
+                        r"```json\s*(\{.*?\})\s*```", m.text, re.S
+                    )
+                    if match:
+                        self.config = Config.from_dict(
+                            json.loads(match.group(1))
+                        )
+                        self.config.storage_msg_id = m.id
+                        return
+        except Exception:
+            pass
+        await self._save_config()
+
+    async def _save_config(self):
+        async with self._cfg_lock:
+            txt = (
+                f"{STORAGE_TAG}\n\n"
+                f"```json\n"
+                f"{json.dumps(self.config.to_dict(), ensure_ascii=False, indent=2)}\n"
+                f"```"
+            )
+            if self.config.storage_msg_id:
+                try:
+                    await self.client.edit_message(
+                        "me", self.config.storage_msg_id, txt
+                    )
+                    return
+                except MessageNotModifiedError:
+                    return
+                except Exception:
+                    pass
+            try:
+                msg = await self.client.send_message("me", txt)
+                self.config.storage_msg_id = msg.id
+            except Exception:
+                pass
+
+    async def _report(self, text):
+        try:
+            await self.client.send_message("me", text)
+        except Exception:
+            pass
+
+    # ── command handlers ─────────────────────────────────────
+
+    def _register_handlers(self):
+        @self.client.on(events.NewMessage(pattern=r"^\..+"))
+        async def _handler(event):
+            try:
+                if event.sender_id != self.owner:
+                    return
+                t = event.text.strip()
+                c = event.chat_id
+
+                if t == ".ماین روشن":
+                    await self._cmd_on(c)
+                elif t == ".ماین خاموش":
+                    await self._cmd_off(c)
+                elif t == ".ماین وضعیت":
+                    await self._cmd_status()
+                elif t == ".ماین تست":
+                    await self._cmd_test(c)
+                elif t.startswith(".ماین زمان"):
+                    m = re.match(r"^\.ماین زمان\s+(\d+:\d+)([MH])$", t)
+                    if m:
+                        await self._cmd_time(m.group(1), m.group(2))
+                    else:
+                        await self._report(
+                            "❌ فرمت نامعتبر.\n"
+                            "مثال: `.ماین زمان 3:50M`\n"
+                            "مثال: `.ماین زمان 2:30H`"
+                        )
+                elif t.startswith(".کلمه ") and len(t) > 6:
+                    kw = t[6:].strip()
+                    if kw:
+                        await self._cmd_keyword(kw)
+                elif t.startswith(".دکمه ") and len(t) > 6:
+                    bt = t[6:].strip()
+                    if bt:
+                        await self._cmd_button(bt)
+            except Exception:
+                pass
+
+    # ── commands ─────────────────────────────────────────────
+
+    async def _cmd_on(self, cid):
+        if cid > 0:
+            return
+        if cid not in self.config.active_chats:
+            self.config.active_chats.append(cid)
+            await self._save_config()
+        self._spawn(cid)
+
+    async def _cmd_off(self, cid):
+        if cid in self.config.active_chats:
+            self.config.active_chats.remove(cid)
+            await self._save_config()
+        self._kill(cid)
+
+    async def _cmd_time(self, ts, unit):
+        secs = self._parse_time(ts, unit)
+        if not secs or secs <= 0:
+            await self._report(
+                "❌ فرمت نامعتبر.\n"
+                "مثال: `.ماین زمان 3:50M` → ۳ دقیقه ۵۰ ثانیه\n"
+                "مثال: `.ماین زمان 2:30H` → ۲ ساعت ۳۰ دقیقه"
+            )
+            return
+        self.config.interval    = secs
+        self.config.time_format = unit
+        await self._save_config()
+        self._restart_all()
+
+    async def _cmd_keyword(self, kw):
+        self.config.keyword = kw
+        await self._save_config()
+
+    async def _cmd_button(self, bt):
+        self.config.button_text = bt
+        await self._save_config()
+
+    async def _cmd_status(self):
+        iv = self.config.interval
+        if self.config.time_format == "M":
+            m, s = divmod(iv, 60)
+            td = f"{m}:{s:02d} دقیقه"
+        else:
+            h, r = divmod(iv, 3600)
+            td = f"{h}:{r // 60:02d} ساعت"
+        cl = (
+            "\n".join(f"  • `{c}`" for c in self.config.active_chats)
+            or "  (هیچ)"
+        )
+        await self._report(
+            f"📊 وضعیت\n"
+            f"⏱ زمان: {td}\n"
+            f"🔤 کلمه: {self.config.keyword}\n"
+            f"🔘 دکمه: {self.config.button_text}\n"
+            f"📋 گروه‌ها:\n{cl}"
+        )
+
+    # ── TEST ─────────────────────────────────────────────────
+
+    async def _cmd_test(self, cid):
+        if cid > 0:
+            await self._report("❌ فقط در گروه.")
+            return
+
+        target = self.config.button_text
+        found_any = False
+        log = []
+
+        try:
+            async for msg in self.client.iter_messages(cid, limit=SEARCH_LIMIT):
+                rm = msg.reply_markup
+                if not rm or not hasattr(rm, "rows"):
+                    continue
+
+                found_any = True
+
+                for ri, row in enumerate(rm.rows):
+                    if not hasattr(row, "buttons"):
+                        continue
+                    for ci, btn in enumerate(row.buttons):
+                        btn_text = getattr(btn, "text", "")
+                        btn_data = getattr(btn, "data", None)
+
+                        if button_matches(btn_text, target):
+                            ok = await self._try_click(msg, cid, ri, ci, btn)
+                            await self._report(
+                                f"🔍 تست:\n"
+                                f"پیام: {msg.id}\n"
+                                f"دکمه: «{btn_text}»\n"
+                                f"Data: {btn_data}\n"
+                                f"نتیجه: {'✅ موفق' if ok else '❌ ناموفق'}"
+                            )
+                            return
+
+                        log.append(f"msg {msg.id} [{ri},{ci}]: «{btn_text}»")
+
+        except Exception as e:
+            await self._report(f"❌ خطا: {e}")
+            return
+
+        if not found_any:
+            await self._report("❌ هیچ Keyboard‌ای در ۵۰ پیام آخر نبود.")
+        else:
+            detail = "\n".join(log[:20]) or "(خالی)"
+            await self._report(
+                f"❌ دکمه «{target}» پیدا نشد.\n"
+                f"دکمه‌های موجود:\n{detail}"
+            )
+
+    # ── time parser ──────────────────────────────────────────
+
+    @staticmethod
+    def _parse_time(ts, unit):
+        try:
+            parts = ts.split(":")
+            a, b = int(parts[0]), int(parts[1])
+            if a < 0 or b < 0:
+                return None
+            if unit == "M" and b < 60:
+                return a * 60 + b
+            if unit == "H" and b < 60:
+                return a * 3600 + b * 60
+        except (ValueError, IndexError):
+            pass
+        return None
+
+    # ── task management ──────────────────────────────────────
+
+    def _spawn(self, cid):
+        self._kill(cid)
+        self.tasks[cid] = asyncio.create_task(self._scheduler(cid))
+
+    def _kill(self, cid):
+        t = self.tasks.pop(cid, None)
+        if t and not t.done():
+            t.cancel()
+
+    def _start_all(self):
+        for cid in list(self.config.active_chats):
+            self._spawn(cid)
+
+    def _restart_all(self):
+        for cid in list(self.tasks.keys()):
+            self._kill(cid)
+        self._start_all()
+
+    # ── scheduler (timestamp-based, drift-free) ──────────────
+
+    async def _scheduler(self, cid):
+        try:
+            # First execution immediately
+            await self._execute_mine(cid)
+            nxt = time.time() + self.config.interval
+
+            while cid in self.config.active_chats:
+                wait = nxt - time.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if cid not in self.config.active_chats:
+                    break
+                await self._execute_mine(cid)
+                nxt += self.config.interval
+                if nxt < time.time():
+                    nxt = time.time() + self.config.interval
+
+        except asyncio.CancelledError:
+            return
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 5)
+            if cid in self.config.active_chats:
+                self._spawn(cid)
+        except (ChatWriteForbiddenError, UserNotParticipantError):
+            if cid in self.config.active_chats:
+                self.config.active_chats.remove(cid)
+                await self._save_config()
+            await self._report(f"⚠️ عدم دسترسی به گروه `{cid}`")
+        except Exception:
+            await asyncio.sleep(30)
+            if cid in self.config.active_chats:
+                self._spawn(cid)
+        finally:
+            self.tasks.pop(cid, None)
+
+    # ── mine execution ───────────────────────────────────────
+
+    async def _execute_mine(self, cid):
+        # Send once and keep the message id for precise reply filtering.
+        sent=None
+        try:
+            sent=await self.client.send_message(cid, self.config.keyword)
+        except (ChatWriteForbiddenError, UserNotParticipantError):
+            raise
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            return
+        except Exception:
+            return
+
+        # Step 2: Retry loop — bot deletes old msg, sends new one
+        #         15 retries × 2s = 30s window (button expires at 60s)
+        for _ in range(CLICK_RETRIES):
+            await asyncio.sleep(CLICK_WAIT)
+            try:
+                if await self._find_and_click(cid, min_id=getattr(sent,"id",None)):
+                    return
+            except FloodWaitError:
+                raise
+            except (ChatWriteForbiddenError, UserNotParticipantError):
+                raise
+            except Exception:
+                continue
+
+    # ── find button in recent messages ───────────────────────
+
+    async def _find_and_click(self, cid, min_id=None):
+        target=self.config.button_text
         async def scan(kwargs):
-            async for message in self.client.iter_messages(chat_id, **kwargs):
-                markup=message.reply_markup
-                if not markup or not hasattr(markup,"rows"): continue
-                for ri,row in enumerate(markup.rows):
-                    for ci,button in enumerate(getattr(row,"buttons",[])):
-                        if button_matches(button_label(button),target):
-                            return await self.click(message,chat_id,ri,ci,button,target)
+            async for msg in self.client.iter_messages(cid, **kwargs):
+                rm=getattr(msg,"reply_markup",None)
+                if not rm or not hasattr(rm,"rows"): continue
+                for ri,row in enumerate(rm.rows):
+                    for ci,btn in enumerate(getattr(row,"buttons",[])):
+                        if button_matches(getattr(btn,"text",""),target):
+                            log.info("button text matched: chat=%s message=%s row=%s col=%s text=%r",cid,msg.id,ri,ci,getattr(btn,"text",""))
+                            return await self._try_click(msg,cid,ri,ci,btn)
             return False
-        kwargs={"limit":RECENT_MESSAGES}
-        if min_id: kwargs["min_id"]=min_id
-        if await scan(kwargs): return True
-        if min_id: return await scan({"limit":RECENT_MESSAGES})
+        try:
+            if await scan({"limit":SEARCH_LIMIT, **({"min_id":min_id} if min_id else {})}): return True
+            # Some bots edit or reuse a message; retain the original fallback scan.
+            if min_id: return await scan({"limit":SEARCH_LIMIT})
+        except FloodWaitError:
+            raise
+        except Exception as exc:
+            log.exception("button scan failed: %s",exc)
         return False
 
-    async def click(self, message: Any, chat_id: int, ri: int, ci: int, button: Any, target: str) -> bool:
-        data=getattr(button,"data",None)
+    # ── click button (4 fallback methods) ────────────────────
+
+    async def _try_click(self, msg, cid, ri, ci, btn):
+        data = getattr(btn, "data", None)
+
+        # Method 1: Raw API callback
         if data and GetBotCallbackAnswerRequest:
             try:
-                peer=await self.client.get_input_entity(chat_id)
-                await self.client(GetBotCallbackAnswerRequest(peer=peer,msg_id=message.id,data=data))
+                peer = await self.client.get_input_entity(cid)
+                await self.client(
+                    GetBotCallbackAnswerRequest(
+                        peer=peer,
+                        msg_id=msg.id,
+                        data=data,
+                    )
+                )
+                log.info("raw callback accepted: chat=%s message=%s row=%s col=%s",cid,msg.id,ri,ci)
                 return True
-            except Exception as exc: log.debug("raw callback failed: %s",exc)
+            except Exception as exc:
+                log.debug("raw callback failed: %s",exc)
+
+        # Method 2: click with callback data
         if data:
-            try: await message.click(data=data); return True
-            except Exception as exc: log.debug("data click failed: %s",exc)
-        try: await message.click(ri,ci); return True
-        except Exception as exc: log.debug("position click failed: %s",exc)
-        try: await message.click(text=target); return True
-        except Exception as exc: log.debug("text click failed: %s",exc)
+            try:
+                await msg.click(data=data)
+                return True
+            except Exception as exc:
+                log.debug("callback data click failed: %s",exc)
+
+        # Method 3: click by position
+        try:
+            await msg.click(ri, ci)
+            return True
+        except Exception as exc:
+            log.debug("position click failed: %s",exc)
+
+        # Method 4: click by text
+        try:
+            await msg.click(text=self.config.button_text)
+            return True
+        except Exception as exc:
+            log.debug("text click failed: %s",exc)
+
         return False
 
-    async def test(self, chat_id: int, keyword: str, button: str) -> str:
-        assert self.client
-        await self.client.send_message(chat_id, keyword)
-        if not button: return "sent-no-button"
-        return "clicked" if await self.find_and_click(chat_id, button) else "button-not-found"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SESSION STRING GENERATOR (for Railway)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def generate_session():
+    api_id   = int(input("API ID: "))
+    api_hash = input("API Hash: ")
+    client   = TelegramClient(StringSession(), api_id, api_hash)
+    await client.connect()
+    phone = input("Phone: ")
+    await client.send_code_request(phone)
+    code = input("Code: ")
+    try:
+        await client.sign_in(phone, code)
+    except SessionPasswordNeededError:
+        pwd = input("2FA: ")
+        await client.sign_in(password=pwd)
+    ss = client.session.save()
+    print(f"\nSESSION_STRING:\n{ss}")
+    await client.disconnect()
 
 
-class WorkerHub:
-    def __init__(self, store: Store): self.store=store; self.threads={}; self.workers={}; self.lock=threading.RLock()
-    def start_all(self):
-        for row in self.store.accounts():
-            if row["enabled"]: self.start(row["id"])
-    def start(self, account_id: int):
-        with self.lock:
-            if account_id in self.threads and self.threads[account_id].is_alive(): return
-            row=self.store.account(account_id)
-            if not row or not row["enabled"]: return
-            def runner():
-                worker=UserWorker(row,self.store); self.workers[account_id]=worker
-                try: asyncio.run(worker.run())
-                finally: self.workers.pop(account_id,None)
-            thread=threading.Thread(target=runner, daemon=True, name=f"telethon-{account_id}"); self.threads[account_id]=thread; thread.start()
-    def stop(self, account_id: int):
-        worker=self.workers.get(account_id)
-        if worker: worker.stop_flag=True
-    def restart(self, account_id: int): self.stop(account_id); time.sleep(0.2); self.start(account_id)
-    def online(self, account_id: int) -> bool: return account_id in self.workers
-    def run_test(self, account_id: int, chat_id: int, keyword: str, button: str) -> str:
-        worker=self.workers.get(account_id)
-        if not worker or not worker.client: return "worker-offline"
-        future=asyncio.run_coroutine_threadsafe(worker.test(chat_id,keyword,button), worker.client.loop)
-        try: return future.result(timeout=60)
-        except Exception as exc: return f"error:{type(exc).__name__}"
+# ═══════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
 
+async def main():
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--generate-session":
+        await generate_session()
+    else:
+        await MineUserbot().run()
 
-@dataclass
-class Flow:
-    kind: str
-    prompts: list[str]
-    values: list[str] = field(default_factory=list)
-    index: int = 0
-    edit_id: int | None = None
-    meta: dict[str, Any] = field(default_factory=dict)
-    field_names: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LoginAttempt:
-    user_id: int
-    chat_id: int
-    name: str
-    phone: str
-    loop: Any = None
-    client: TelegramClient | None = None
-    phone_code_hash: str = ""
-    thread: threading.Thread | None = None
-    finished: bool = False
-
-
-class LoginBroker:
-    def __init__(self, store, hub, notifier):
-        self.store=store; self.hub=hub; self.notifier=notifier; self.attempts={}; self.lock=threading.RLock()
-    def start(self,user,chat,name,phone):
-        attempt=LoginAttempt(user,chat,clean(name),clean(phone)); self.attempts[user]=attempt
-        def runner():
-            loop=asyncio.new_event_loop(); asyncio.set_event_loop(loop); attempt.loop=loop; attempt.client=TelegramClient(StringSession(),API_ID,API_HASH)
-            try: loop.run_until_complete(self._send_code(attempt)); loop.run_forever()
-            except Exception as exc: log.exception("phone login start failed"); self.notifier(chat,f"❌ شروع ورود ناموفق: {safe_html(exc)}")
-            finally:
-                if attempt.client: loop.run_until_complete(attempt.client.disconnect())
-                loop.close()
-        attempt.thread=threading.Thread(target=runner,daemon=True,name=f"login-{user}"); attempt.thread.start()
-    async def _send_code(self,attempt):
-        await attempt.client.connect(); sent=await attempt.client.send_code_request(attempt.phone); attempt.phone_code_hash=sent.phone_code_hash
-    def submit(self,user,kind,value):
-        attempt=self.attempts.get(user)
-        if not attempt or not attempt.loop or not attempt.client: return
-        asyncio.run_coroutine_threadsafe(self._finish_step(attempt,kind,value),attempt.loop)
-    async def _finish_step(self,attempt,kind,value):
-        try:
-            if kind=="code": await attempt.client.sign_in(attempt.phone,value,phone_code_hash=attempt.phone_code_hash)
-            elif kind=="password":
-                if value: await attempt.client.sign_in(password=value)
-                else:
-                    if not await attempt.client.is_user_authorized(): raise RuntimeError("رمز دومرحله‌ای لازم است؛ مقدار رمز را وارد کنید")
-            if await attempt.client.is_user_authorized(): await self.finish(attempt)
-        except SessionPasswordNeededError:
-            self.notifier(attempt.chat_id,"🔐 این حساب رمز دومرحله‌ای دارد؛ رمز را وارد کنید.")
-        except Exception as exc:
-            self.notifier(attempt.chat_id,f"❌ ورود ناموفق: {safe_html(exc)}")
-    async def finish(self,attempt):
-        session=attempt.client.session.save(); ident=self.store.create_account(attempt.name,session); self.store.audit(attempt.user_id,"phone-login-complete",str(ident)); self.hub.start(ident); attempt.finished=True; self.notifier(attempt.chat_id,"✅ ورود حساب کامل شد و Worker فعال شد."); self.attempts.pop(attempt.user_id,None); attempt.loop.stop()
-    def cancel(self,user):
-        attempt=self.attempts.pop(user,None)
-        if attempt and attempt.loop: attempt.loop.call_soon_threadsafe(attempt.loop.stop)
-
-
-class ManagerBot:
-    def __init__(self):
-        self.api=f"https://api.telegram.org/bot{MANAGER_BOT_TOKEN}"; self.store=Store(); self.hub=WorkerHub(self.store); self.flows={}; self.offset=0; self.login=LoginBroker(self.store,self.hub,self.send)
-
-    def _remove_button_styles(self, value):
-        if isinstance(value, dict): return {k:self._remove_button_styles(v) for k,v in value.items() if k not in {"style","icon_custom_emoji_id"}}
-        if isinstance(value, list): return [self._remove_button_styles(v) for v in value]
-        return value
-    def api_call(self, method: str, **payload):
-        response=requests.post(f"{self.api}/{method}",json=payload,timeout=40); response.raise_for_status(); data=response.json()
-        if not data.get("ok"):
-            description=data.get("description","Telegram API error")
-            if USE_BUTTON_STYLES and "style" in json.dumps(payload, ensure_ascii=False):
-                log.warning("Styled keyboard rejected; retrying without styles: %s", description)
-                return self.api_call(method, **self._remove_button_styles(payload))
-            raise RuntimeError(description)
-        return data["result"]
-    def button(self,text,data,style=None):
-        if style is None:
-            style=STYLE_DANGER if any(x in data for x in ("delete","cancel","clear")) else STYLE_SUCCESS if any(x in data for x in ("add","test","run","toggle","enable")) else STYLE_PRIMARY
-        result={"text":text,"callback_data":data}
-        if USE_BUTTON_STYLES and style in VALID_STYLES: result["style"]=style
-        return result
-    def button_row(self,*items): return [self.button(text,data) for text,data in items]
-    def safe_button(self,text,data): return self.button(clean(text)[:32], clean(data)[:64])
-    def send(self,chat,text,keys=None,edit=None):
-        payload={"chat_id":chat,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
-        if keys is not None: payload["reply_markup"]={"inline_keyboard":keys}
-        if edit: payload["message_id"]=edit; return self.api_call("editMessageText",**payload)
-        return self.api_call("sendMessage",**payload)
-    def answer(self,qid,text=""): self.api_call("answerCallbackQuery",callback_query_id=qid,text=text[:190])
-    def back(self,data="home"): return [[self.button("↩️ بازگشت",data)]]
-
-    def home(self,chat,edit=None):
-        keys=[[self.button("👤 حساب‌ها","accounts"),self.button("⚙️ سناریوها","scenarios")],[self.button("🧪 تست اتصال","test_manager"),self.button("📊 وضعیت","status")],[self.button("🧰 ابزارها","tools"),self.button("🧾 گزارش","audit")],[self.button("❔ راهنما","help")]]
-        self.send(chat,"<b>مرکز مدیریت Session</b>\n\nحساب‌های عملیاتی و سناریوهای زمان‌بندی‌شده را از همین پنل کنترل کنید.",keys,edit)
-    def page(self,chat,name,edit=None):
-        if name=="accounts":
-            keys=[[self.button("➕ افزودن Session","add_account")],[self.button("📋 فهرست و وضعیت","list_accounts")],[self.button("✏️ ویرایش","edit_account")],[self.button("🔄 روشن/خاموش","toggle_account")],[self.button("🗑 حذف","delete_account")]]; text="<b>👤 حساب‌های عملیاتی</b>\nSession رمزنگاری‌شده نگهداری می‌شود."
-        elif name=="scenarios":
-            keys=[[self.button("➕ افزودن سناریو","add_scenario")],[self.button("📋 فهرست","list_scenarios")],[self.button("✏️ ویرایش","edit_scenario")],[self.button("▶️ روشن/خاموش","toggle_scenario")],[self.button("🗑 حذف","delete_scenario")]]; text="<b>⚙️ سناریوها</b>\nفاصلهٔ همهٔ سناریوها برحسب دقیقه است."
-        elif name=="tools":
-            keys=[[self.button("⏱ فاصلهٔ polling","set_poll")],[self.button("⏳ timeout پیش‌فرض","set_timeout")],[self.button("💾 پشتیبان متنی","backup")],[self.button("🧹 پاک‌سازی گزارش","clear_audit")]]; text="<b>🧰 ابزارها</b>"
-        elif name=="status": return self.status(chat,edit)
-        elif name=="audit": return self.audit(chat,edit)
-        elif name=="help": return self.send(chat,self.help_text(),self.back(),edit)
-        else: return self.home(chat,edit)
-        self.send(chat,text,keys+[self.back()[0]],edit)
-    def help_text(self):
-        return """<b>راهنمای پنل مدیریت</b>\n\n<b>حساب عملیاتی</b>\nاز بخش حساب‌ها یک Session String کامل Telethon را در گفت‌وگوی خصوصی وارد کنید. این Session متعلق به حساب Telegram است و پس از رمزنگاری در دیتابیس ذخیره می‌شود.\n\n<b>سناریو</b> هر سناریو حساب، chat_id، کلمه، دکمهٔ اختیاری، فاصلهٔ دقیقه‌ای و timeout دارد. اگر متن دکمه خالی باشد فقط کلمه ارسال می‌شود. اگر دکمه تعیین شود، Worker بعد از ارسال کلمه هر نیم‌ثانیه پیام‌های اخیر را بررسی می‌کند.\n\n<b>زمان‌بندی</b> فاصلهٔ سناریوها دقیقه‌ای است؛ 1 یعنی یک دقیقه و 0.5 یعنی ۳۰ ثانیه. زمان‌بندی هر سناریو مستقل است و اجرای طولانی یک سناریو، سناریوی دیگر را متوقف نمی‌کند.\n\n<b>دسترسی</b> حساب عملیاتی باید واقعاً عضو گروه باشد و دسترسی ارسال/خواندن/کلیک داشته باشد. پنل مدیر نمی‌تواند عضویت یا دسترسی را جعل کند.\n\n<b>امنیت</b> توکن Bot مدیر، API Hash، FERNET_KEY و Session را در چت عمومی منتشر نکنید. فقط ADMIN_IDS اجازهٔ استفاده از این پنل را دارند."""
-    def status_snapshot(self) -> dict[str, Any]:
-        accounts=self.store.accounts(); scenarios=self.store.scenarios()
-        return {"accounts":len(accounts),"online_workers":sum(self.hub.online(a["id"]) for a in accounts),"scenarios":len(scenarios),"active_scenarios":sum(int(r["enabled"]) for r in scenarios),"poll_interval":POLL_INTERVAL,"database":DB_PATH}
-    def status(self,chat,edit=None):
-        snap=self.status_snapshot()
-        text=f"<b>📊 وضعیت سیستم</b>\nنسخه: <code>{RELEASE_VERSION}</code>\nحساب‌ها: {snap['accounts']}\nWorker آنلاین: {snap['online_workers']}\nسناریوها: {snap['scenarios']}\nسناریوهای فعال: {snap['active_scenarios']}\nPolling: {snap['poll_interval']:g} ثانیه\nDatabase: {safe_html(snap['database'])}"
-        self.send(chat,text,self.back(),edit)
-    def audit_rows(self, limit: int = 20):
-        return self.store.all("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (max(1,min(limit,100)),))
-    def audit(self,chat,edit=None):
-        rows=self.audit_rows(); lines=[f"• <code>{safe_html(r['created_at'])}</code> — {safe_html(r['action'])} {safe_html(r['details'])}" for r in rows]
-        self.send(chat,"<b>🧾 گزارش فعالیت</b>\n"+("\n".join(lines) or "موردی ثبت نشده است."),self.back(),edit)
-    def begin(self,user,chat,kind,prompts,edit=None,meta=None,field_names=None):
-        self.flows[user]=Flow(kind,prompts,edit_id=edit,meta=meta or {},field_names=field_names or []); self.send(chat,f"<b>مرحلهٔ ۱ از {len(prompts)}</b>\n{prompts[0]}\n\nلغو: /cancel",[[self.button("❌ لغو","cancel")]])
-    def choose_account(self, chat, action, edit=None):
-        rows=[[self.button(f"👤 {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.accounts() if row['enabled']]
-        rows.append([self.button("↩️ بازگشت", "accounts" if action == "edit_account_pick" else "scenarios")])
-        self.send(chat, "<b>حساب را انتخاب کنید</b>\nشناسه را دستی وارد نکنید.", rows, edit)
-    def edit_stage_menu(self, chat, kind, ident, edit=None):
-        if kind == "account":
-            title="<b>ویرایش حساب — مرحله را انتخاب کنید</b>"
-            items=[("1️⃣ نام حساب","account_name"),("2️⃣ Session String","account_session")]
-        else:
-            title="<b>ویرایش سناریو — مرحله را انتخاب کنید</b>"
-            items=[("1️⃣ نام سناریو","scenario_name"),("2️⃣ chat_id گروه","scenario_chat"),("3️⃣ کلمه/فرمان","scenario_keyword"),("4️⃣ متن دکمه","scenario_button"),("5️⃣ فاصلهٔ اجرا","scenario_interval"),("6️⃣ timeout","scenario_timeout")]
-        keys=[[self.button(label,f"edit_stage:{kind}:{ident}:{field}")] for label,field in items]
-        keys.append(self.back("accounts" if kind == "account" else "scenarios")[0:1][0:1])
-        self.send(chat,title+"\n\nفقط عدد مرحلهٔ موردنظر را انتخاب کنید؛ سایر تنظیمات تغییر نمی‌کنند.",keys,edit)
-    def choose_scenario(self, chat, action, edit=None):
-        rows=[[self.button(f"⚙️ {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.scenarios()]
-        rows.append([self.button("↩️ بازگشت", "scenarios")])
-        self.send(chat, "<b>سناریو را انتخاب کنید</b>\nشناسه را دستی وارد نکنید.", rows, edit)
-    def choose_account_action(self, chat, action, edit=None):
-        rows=[[self.button(f"👤 {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.accounts()]
-        rows.append([self.button("↩️ بازگشت", "accounts")])
-        self.send(chat, "<b>حساب را انتخاب کنید</b>\nشناسه داخلی از داخل دکمه انتخاب می‌شود.", rows, edit)
-    def prompt_next(self,user,chat):
-        flow=self.flows[user]; self.send(chat,f"<b>مرحلهٔ {flow.index+1} از {len(flow.prompts)}</b>\n{flow.prompts[flow.index]}\n\nلغو: /cancel",[[self.button("❌ لغو","cancel")]])
-    def receive_flow(self,user,chat,text):
-        flow=self.flows[user]
-        if text=="/cancel": self.login.cancel(user); self.flows.pop(user,None); return self.home(chat)
-        if flow.kind == "phone_code":
-            self.login.submit(user,"code",text.strip()); self.flows[user]=Flow("phone_2fa",["رمز دومرحله‌ای؛ اگر ندارید /skip بفرستید"]); return self.send(chat,"✅ کد دریافت شد. اگر حساب رمز دومرحله‌ای دارد، رمز را بفرستید؛ در غیر این صورت /skip.",[[self.button("❌ لغو","cancel")]])
-        if flow.kind == "phone_2fa":
-            self.login.submit(user,"password","" if text == "/skip" else text.strip()); self.flows.pop(user,None); return self.send(chat,"⏳ ورود در حال نهایی‌شدن است.",self.back("accounts"))
-        flow.values.append(text.strip()); flow.index+=1
-        if flow.kind == "phone_start":
-            if flow.index < len(flow.prompts): return self.prompt_next(user,chat)
-            name,phone=flow.values; self.flows.pop(user,None); self.login.start(user,chat,name,phone); self.flows[user]=Flow("phone_code",["کد ورود Telegram"]); return self.send(chat,"📨 کد ورود ارسال شد؛ کد را همین‌جا بفرستید.",[[self.button("❌ لغو","cancel")]])
-        if flow.index<len(flow.prompts): return self.prompt_next(user,chat)
-        flow.values.append(text.strip()); flow.index+=1
-        if flow.index<len(flow.prompts): return self.prompt_next(user,chat)
-        values=dict(zip(flow.field_names,flow.values)) if flow.field_names else flow.values; self.flows.pop(user,None)
-        try: result=self.commit_flow(user,flow.kind,values,flow.meta)
-        except Exception as exc: log.exception("form commit failed"); result=f"❌ خطا: {safe_html(exc)}"
-        self.send(chat,result,[[self.button("↩️ منوی اصلی","home")]])
-    def commit_flow(self,user,kind,v,meta=None):
-        meta=meta or {}
-        if kind == "add_scenario" and isinstance(v,dict):
-            aid=int(meta.get("account_id",0)); name=clean(v.get("name")); cid=InputValidator.chat_id(v.get("chat_id")); keyword=InputValidator.keyword(v.get("keyword")); button=clean(v.get("button")); minutes=parse_duration_minutes(v.get("interval")); timeout=parse_duration_minutes(v.get("timeout"),"seconds")
-            if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد یا حذف شده است")
-            ident=self.store.create_scenario(name,aid,cid,keyword,button,minutes,timeout); self.store.audit(user,"scenario-add",str(ident)); self.hub.start(aid); return "✅ سناریو ذخیره شد."
-        if kind=="add_account":
-            ident=self.store.create_account(clean(v[0]),clean(v[1])); self.store.audit(user,"account-add",str(ident)); self.hub.start(ident); return "✅ حساب و Session ثبت شد و Worker در حال اتصال است."
-        if kind=="edit_stage_value":
-            ident=int(meta["id"]); kind_name=meta["kind"]; field=meta["field"]; row=self.store.account(ident) if kind_name=="account" else self.store.scenario(ident)
-            if not row: raise ValueError("مورد انتخاب‌شده پیدا نشد")
-            value=clean(v[0])
-            if kind_name=="account":
-                if field=="account_name": self.store.update_account(ident,value)
-                elif field=="account_session":
-                    if value!="/skip": self.store.update_account(ident,row["name"],InputValidator.session(value))
-                    else: return "✅ بدون تغییر ذخیره شد."
-                else: raise ValueError("مرحله حساب نامعتبر است")
-            else:
-                name,aid,cid,keyword,button,minutes,timeout=row["name"],row["account_id"],row["chat_id"],row["keyword"],row["button"],row["interval_minutes"],row["timeout_seconds"]
-                if field=="scenario_name": name=value
-                elif field=="scenario_chat": cid=InputValidator.chat_id(value)
-                elif field=="scenario_keyword": keyword=InputValidator.keyword(value)
-                elif field=="scenario_button": button="" if value=="/none" else value
-                elif field=="scenario_interval": minutes=parse_duration_minutes(value)
-                elif field=="scenario_timeout": timeout=parse_duration_seconds(value)
-                else: raise ValueError("مرحله سناریو نامعتبر است")
-                self.store.update_scenario(ident,name,aid,cid,keyword,button,minutes,timeout)
-            self.store.audit(user,"edit-stage",f"{kind_name}:{ident}:{field}"); return "✅ فقط همان مرحله ویرایش شد و سایر تنظیمات حفظ شدند."
-        if kind=="edit_account":
-            ident=int(meta.get("account_id", 0))
-            if not self.store.account(ident): raise ValueError("حساب انتخاب‌شده پیدا نشد")
-            self.store.update_account(ident,clean(v[0]),clean(v[1]) or None); self.store.audit(user,"account-edit",str(ident)); self.hub.restart(ident); return "✅ حساب ویرایش شد."
-        if kind in ("add_scenario","edit_scenario"):
-            if kind == "add_scenario":
-                name,cid,keyword,button,minutes,timeout,aid=parse_scenario_values(v,meta)
-                if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد یا حذف شده است")
-                ident=self.store.create_scenario(name,aid,cid,keyword,button,minutes,timeout); action="scenario-add"
-            else:
-                if len(v) == 6:
-                    ident=int(meta.get("scenario_id", 0)); aid=int(meta.get("account_id", 0)); name,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),clean(v[2]),clean(v[3]),parse_duration_minutes(v[4]),parse_duration_seconds(v[5])
-                else:
-                    ident=int(v[0]); name,aid,cid,keyword,button,minutes,timeout=clean(v[1]),int(v[2]),int(v[3]),clean(v[4]),clean(v[5]),parse_duration_minutes(v[6]),parse_duration_seconds(v[7])
-                if not self.store.scenario(ident): raise ValueError("سناریوی انتخاب‌شده وجود ندارد")
-                if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد")
-                self.store.update_scenario(ident,name,aid,cid,keyword,button,minutes,timeout); action="scenario-edit"
-            self.store.audit(user,action,str(ident)); self.hub.start(aid); return "✅ سناریو ذخیره شد. برای اجرای خودکار آن را روشن کنید."
-        if kind=="set_poll": self.store.set_setting("poll_seconds",str(number(v[0]))); self.store.audit(user,"poll-change",v[0]); return "✅ فاصلهٔ polling ذخیره شد؛ مقدار محیطی فعلی پس از Restart اعمال می‌شود."
-        if kind=="set_timeout": self.store.set_setting("timeout_seconds",str(number(v[0],1))); self.store.audit(user,"timeout-change",v[0]); return "✅ timeout پیش‌فرض ذخیره شد."
-        return "ℹ️ عملیات ثبت شد."
-    def list_accounts(self,chat,edit=None):
-        rows=self.store.accounts(); lines=[]
-        for r in rows: lines.append(f"<b>#{r['id']} {safe_html(r['name'])}</b> — {'روشن' if r['enabled'] else 'خاموش'} — {safe_html(r['last_status'])} — Session: {secret_preview(r['session_blob'])}")
-        self.send(chat,"<b>👤 حساب‌ها</b>\n"+("\n".join(lines) or "موردی نیست"),self.back("accounts"),edit)
-    def list_scenarios(self,chat,edit=None):
-        rows=self.store.scenarios(); lines=[]
-        for r in rows: lines.append(f"<b>#{r['id']} {safe_html(r['name'])}</b> — حساب {r['account_id']} — <code>{r['chat_id']}</code> — {r['interval_minutes']:g} دقیقه — {'روشن' if r['enabled'] else 'خاموش'} — {safe_html(r['last_result'])}")
-        self.send(chat,"<b>⚙️ سناریوها</b>\n"+("\n".join(lines) or "موردی نیست"),self.back("scenarios"),edit)
-    def callback(self,user,chat,data,msg,qid):
-        try: self.answer(qid)
-        except Exception: pass
-        if user not in ADMIN_IDS: return
-        if data=="home": return self.home(chat,msg)
-        if data in {"accounts","scenarios","tools","status","audit","help"}: return self.page(chat,data,msg)
-        if data=="test_manager":
-            try: me=self.api_call("getMe"); self.send(chat,f"✅ اتصال مدیر موفق است: @{safe_html(me.get('username',''))}",self.back(),msg)
-            except Exception as exc: self.send(chat,f"❌ اتصال ناموفق: {safe_html(exc)}",self.back(),msg)
-            return
-        if data=="list_accounts": return self.list_accounts(chat,msg)
-        if data=="list_scenarios": return self.list_scenarios(chat,msg)
-        if data=="add_account":
-            keys=[[self.button("🔐 ورود با Session String","add_account_session")],[self.button("📱 ورود با شماره و کد","add_account_phone")],self.back("accounts")[0]]
-            return self.send(chat,"<b>روش ورود حساب را انتخاب کنید</b>\n\nSession String یا ورود معمولی با شماره، کد Telegram و در صورت نیاز رمز دومرحله‌ای.",keys,msg)
-        if data=="add_account_session": return self.begin(user,chat,"add_account",["نام نمایشی حساب","Session String کامل Telethon"],msg)
-        if data=="add_account_phone": return self.begin(user,chat,"phone_start",["نام نمایشی حساب","شماره تلفن با کد کشور؛ مثل +989121234567"],msg)
-        if data=="edit_account": return self.choose_account_action(chat,"pick_edit_account",msg)
-        if data.startswith("pick_edit_account:"):
-            ident=int(data.split(":",1)[1]); row=self.store.account(ident)
-            if not row: return self.send(chat,"❌ حساب پیدا نشد.",self.back("accounts"),msg)
-            return self.edit_stage_menu(chat,"account",ident,msg)
-        if data=="add_scenario": return self.choose_account(chat,"pick_scenario_account",msg)
-        if data.startswith("pick_scenario_account:"):
-            aid=int(data.split(":",1)[1]);
-            if not self.store.account(aid): return self.send(chat,"❌ این حساب دیگر وجود ندارد؛ دوباره انتخاب کنید.",self.back("scenarios"),msg)
-            return self.begin(user,chat,"add_scenario",["نام سناریو","chat_id گروه مثل -1001234567890","کلمه یا فرمان","متن دکمه؛ بدون دکمه خالی بفرستید","فاصله؛ مثل 3:05 یا 2 ساعت","timeout؛ مثل 15 یا 15 ثانیه"],msg,{"account_id":aid},["name","chat_id","keyword","button","interval","timeout"])
-        if data=="edit_scenario": return self.choose_scenario(chat,"pick_edit_scenario",msg)
-        if data.startswith("pick_edit_scenario:"):
-            ident=int(data.split(":",1)[1]); row=self.store.scenario(ident)
-            if not row: return self.send(chat,"❌ سناریو پیدا نشد.",self.back("scenarios"),msg)
-            return self.edit_stage_menu(chat,"scenario",ident,msg)
-        if data.startswith("edit_stage:"):
-            _,kind,ident,field=data.split(":",3); ident=int(ident)
-            prompts={"account_name":"نام جدید حساب","account_session":"Session جدید؛ برای حفظ قبلی /skip بفرستید","scenario_name":"نام جدید سناریو","scenario_chat":"chat_id جدید گروه","scenario_keyword":"کلمه یا فرمان جدید","scenario_button":"متن دکمهٔ جدید؛ برای حذف دکمه /none","scenario_interval":"فاصلهٔ جدید؛ مثل 3:05 یا 2 ساعت","scenario_timeout":"timeout جدید؛ مثل 15 ثانیه"}
-            if field not in prompts: return self.send(chat,"❌ مرحله نامعتبر است.",self.back("home"),msg)
-            return self.begin(user,chat,"edit_stage_value",[prompts[field]],msg,{"kind":kind,"id":ident,"field":field})
-        if data=="set_poll": return self.begin(user,chat,data,["فاصله polling برحسب ثانیه؛ پیشنهاد 0.5"],msg)
-        if data=="set_timeout": return self.begin(user,chat,data,["timeout پیش‌فرض برحسب ثانیه"],msg)
-        if data=="toggle_account": return self.choose_account_action(chat,"pick_toggle_account",msg)
-        if data.startswith("pick_toggle_account:"):
-            ident=int(data.split(":",1)[1]); return self.toggle_choice(chat,"account",ident,msg)
-        if data=="delete_account": return self.choose_account_action(chat,"pick_delete_account",msg)
-        if data.startswith("pick_delete_account:"):
-            ident=int(data.split(":",1)[1]); return self.confirm_delete(chat,"account",ident,msg)
-        if data=="toggle_scenario": return self.choose_scenario(chat,"pick_toggle_scenario",msg)
-        if data.startswith("pick_toggle_scenario:"):
-            ident=int(data.split(":",1)[1]); return self.toggle_choice(chat,"scenario",ident,msg)
-        if data=="delete_scenario": return self.choose_scenario(chat,"pick_delete_scenario",msg)
-        if data.startswith("pick_delete_scenario:"):
-            ident=int(data.split(":",1)[1]); return self.confirm_delete(chat,"scenario",ident,msg)
-        if data.startswith("confirm_toggle:"):
-            _,kind,ident,enabled=data.split(":"); return self.confirm_toggle_callback(user,chat,kind,int(ident),int(enabled),msg)
-        if data.startswith("confirm_delete:"):
-            _,kind,ident=data.split(":"); return self.confirm_delete_callback(user,chat,kind,int(ident),msg)
-        if data=="backup": return self.send(chat,"<pre>"+safe_html(self.store.export_json())+"</pre>",self.back("tools"),msg)
-        if data=="clear_audit": self.store.execute("DELETE FROM audit"); self.send(chat,"✅ گزارش پاک شد.",self.back("tools"),msg); return
-        if data=="cancel": self.login.cancel(user); self.flows.pop(user,None); return self.home(chat,msg)
-        self.send(chat,"❌ گزینه ناشناخته است.",self.back(),msg)
-    def toggle_choice(self, chat, kind, ident, edit=None):
-        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
-        if not row:
-            return self.send(chat, "❌ مورد انتخاب‌شده دیگر وجود ندارد.", self.back("accounts" if kind == "account" else "scenarios"), edit)
-        label = safe_html(row["name"])
-        keys = [[self.button("✅ روشن", f"confirm_toggle:{kind}:{ident}:1"), self.button("⏸ خاموش", f"confirm_toggle:{kind}:{ident}:0")], self.back("accounts" if kind == "account" else "scenarios")[0]]
-        self.send(chat, f"وضعیت مورد <b>{label}</b> را انتخاب کنید.", keys, edit)
-    def confirm_delete(self, chat, kind, ident, edit=None):
-        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
-        if not row:
-            return self.send(chat, "❌ مورد انتخاب‌شده پیدا نشد.", self.back("accounts" if kind == "account" else "scenarios"), edit)
-        keys = [[self.button("🗑 بله، حذف شود", f"confirm_delete:{kind}:{ident}"), self.button("لغو", "cancel")]]
-        self.send(chat, f"⚠️ حذف <b>{safe_html(row['name'])}</b> قطعی است؟", keys, edit)
-    def confirm_toggle_callback(self, user, chat, kind, ident, enabled, msg):
-        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
-        if not row: return self.send(chat, "❌ مورد پیدا نشد.", self.back("home"), msg)
-        if kind == "account":
-            self.store.set_account_enabled(ident, bool(enabled)); self.store.audit(user, "account-toggle", f"{ident}:{enabled}")
-            if enabled: self.hub.start(ident)
-            else: self.hub.stop(ident)
-        else:
-            self.store.set_scenario_enabled(ident, bool(enabled)); self.store.audit(user, "scenario-toggle", f"{ident}:{enabled}")
-            self.hub.start(row["account_id"])
-        self.send(chat, "✅ وضعیت با موفقیت تغییر کرد.", self.back("accounts" if kind == "account" else "scenarios"), msg)
-    def confirm_delete_callback(self, user, chat, kind, ident, msg):
-        row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
-        if not row: return self.send(chat, "❌ مورد پیدا نشد.", self.back("home"), msg)
-        if kind == "account": self.hub.stop(ident); self.store.delete_account(ident)
-        else: self.store.delete_scenario(ident)
-        self.store.audit(user, "delete", f"{kind}:{ident}")
-        self.send(chat, "✅ حذف شد.", self.back("accounts" if kind == "account" else "scenarios"), msg)
-    def special_commit(self,user,kind,v):
-        if kind=="toggle_account":
-            ident=int(v[0]); enabled=normalize(v[1]) in ("روشن","on","1","yes"); self.store.set_account_enabled(ident,enabled); self.store.audit(user,"account-toggle",f"{ident}:{enabled}"); (self.hub.start if enabled else self.hub.stop)(ident); return "✅ وضعیت حساب تغییر کرد."
-        if kind=="delete_account":
-            if normalize(v[1])!="حذف": return "❌ تأیید حذف نامعتبر بود."
-            ident=int(v[0]); self.hub.stop(ident); self.store.delete_account(ident); self.store.audit(user,"account-delete",str(ident)); return "✅ حساب و سناریوهای وابسته حذف شدند."
-        if kind=="toggle_scenario":
-            ident=int(v[0]); enabled=normalize(v[1]) in ("روشن","on","1","yes"); row=self.store.scenario(ident); self.store.set_scenario_enabled(ident,enabled); self.store.audit(user,"scenario-toggle",f"{ident}:{enabled}"); self.hub.start(row["account_id"]); return "✅ وضعیت سناریو تغییر کرد."
-        if kind=="delete_scenario":
-            if normalize(v[1])!="حذف": return "❌ تأیید حذف نامعتبر بود."
-            ident=int(v[0]); self.store.delete_scenario(ident); self.store.audit(user,"scenario-delete",str(ident)); return "✅ سناریو حذف شد."
-        return None
-    def process_message(self,msg):
-        user=msg.get("from",{}).get("id"); chat=msg.get("chat",{}).get("id"); text=msg.get("text","")
-        if user not in ADMIN_IDS:return
-        if text=="/start": return self.home(chat)
-        if user in self.flows:
-            flow=self.flows[user]
-            if flow.kind in {"toggle_account","delete_account","toggle_scenario","delete_scenario"}:
-                flow.values.append(text.strip()); flow.index+=1
-                if flow.index<len(flow.prompts): return self.prompt_next(user,chat)
-                self.flows.pop(user,None); result=self.special_commit(user,flow.kind,flow.values); return self.send(chat,result,self.back())
-            return self.receive_flow(user,chat,text)
-        return self.home(chat)
-    def run(self):
-        self.hub.start_all()
-        try: self.api_call("deleteWebhook",drop_pending_updates=False)
-        except Exception: log.exception("could not delete webhook")
-        log.info("manager online")
-        while True:
-            try:
-                updates=self.api_call("getUpdates",offset=self.offset,timeout=25,allowed_updates=["message","callback_query"])
-                for update in updates:
-                    self.offset=update["update_id"]+1
-                    if "callback_query" in update:
-                        q=update["callback_query"]; message=q.get("message",{}); self.callback(q["from"]["id"],message.get("chat",{}).get("id"),q.get("data",""),message.get("message_id"),q["id"])
-                    elif "message" in update: self.process_message(update["message"])
-            except KeyboardInterrupt:return
-            except Exception: log.exception("manager loop error"); time.sleep(3)
-
-
-
-class InputValidator:
-    @staticmethod
-    def account_name(value):
-        value=clean(value)
-        if not 2 <= len(value) <= 40: raise ValueError("نام حساب باید بین ۲ تا ۴۰ نویسه باشد")
-        if value.startswith("#"): raise ValueError("نام حساب نباید با # شروع شود")
-        return value
-    @staticmethod
-    def session(value):
-        value=clean(value)
-        if len(value) < 80: raise ValueError("Session کوتاه است؛ Session کامل Telethon را وارد کنید")
-        if not re.match(r"^[A-Za-z0-9_-]+=*$", value): raise ValueError("فرمت Session شامل نویسهٔ نامعتبر است")
-        return value
-    @staticmethod
-    def chat_id(value):
-        value=clean(value)
-        if not re.fullmatch(r"-?\d+", value): raise ValueError("chat_id باید عددی باشد، مثل -1001234567890")
-        return int(value)
-    @staticmethod
-    def keyword(value):
-        value=clean(value)
-        if not value or len(value)>200: raise ValueError("کلمه یا فرمان خالی/بیش از حد طولانی است")
-        return value
-    @staticmethod
-    def interval(value):
-        parsed=parse_duration_minutes(value)
-        if parsed>10080: raise ValueError("فاصله نمی‌تواند بیشتر از یک هفته باشد")
-        return parsed
-    @staticmethod
-    def timeout(value):
-        parsed=number(value,1)
-        if parsed>600: raise ValueError("timeout نمی‌تواند بیشتر از ۶۰۰ ثانیه باشد")
-        return parsed
-    @staticmethod
-    def switch(value):
-        value=normalize(value)
-        if value in {"روشن","on","1","yes","فعال"}: return True
-        if value in {"خاموش","off","0","no","غیرفعال"}: return False
-        raise ValueError("فقط روشن یا خاموش وارد کنید")
-
-
-class BackupService:
-    def __init__(self, store): self.store=store
-    def create(self):
-        payload=json.loads(self.store.export_json())
-        payload["database_path"]=DB_PATH
-        payload["account_count"]=self.store.account_count()
-        payload["scenario_count"]=self.store.scenario_count()
-        return json.dumps(payload,ensure_ascii=False,indent=2)
-    def redacted(self):
-        payload=json.loads(self.create())
-        for item in payload.get("accounts",[]): item.pop("session_blob",None)
-        return json.dumps(payload,ensure_ascii=False,indent=2)
-    def write(self,path):
-        with open(path,"w",encoding="utf-8") as handle: handle.write(self.create())
-        return path
-    def size(self):
-        return len(self.create().encode())
-    def checksum(self):
-        import hashlib
-        return hashlib.sha256(self.create().encode()).hexdigest()
-    def restore_guard(self,payload):
-        if not isinstance(payload,dict) or payload.get("version") not in {5,6}: raise ValueError("نسخهٔ پشتیبان ناشناخته است")
-        if "accounts" not in payload or "scenarios" not in payload: raise ValueError("پشتیبان ناقص است")
-        return True
-
-
-class RateLimiter:
-    def __init__(self, minimum=0.3): self.minimum=minimum; self.last={}; self.lock=threading.Lock()
-    def allowed(self,key):
-        now=time.monotonic()
-        with self.lock:
-            previous=self.last.get(key,0.0)
-            if now-previous<self.minimum: return False
-            self.last[key]=now; return True
-    def reset(self,key):
-        with self.lock: self.last.pop(key,None)
-    def clear(self):
-        with self.lock: self.last.clear()
-
-
-class WorkerHealth:
-    def __init__(self,hub,store): self.hub=hub; self.store=store
-    def account(self,ident):
-        row=self.store.account(ident)
-        if not row: return {"exists":False,"online":False}
-        return {"exists":True,"id":ident,"name":row["name"],"enabled":bool(row["enabled"]),"online":self.hub.online(ident),"status":row["last_status"],"error":row["last_error"]}
-    def all(self): return [self.account(row["id"]) for row in self.store.accounts()]
-    def online_count(self): return sum(item["online"] for item in self.all())
-    def errors(self): return [item for item in self.all() if item.get("error")]
-    def report(self): return {"workers":self.all(),"online":self.online_count(),"errors":len(self.errors()),"generated_at":utc_now()}
-
-
-class ScheduleMath:
-    @staticmethod
-    def period(minutes): return max(6.0,float(minutes)*60.0)
-    @staticmethod
-    def next_time(now,previous,minutes):
-        period=ScheduleMath.period(minutes); candidate=previous+period
-        while candidate<=now: candidate+=period
-        return candidate
-    @staticmethod
-    def delay(now,next_run): return max(0.1,next_run-now)
-    @staticmethod
-    def minute_label(value):
-        value=float(value)
-        if value.is_integer(): return f"{int(value)} دقیقه"
-        return f"{value:g} دقیقه"
-    @staticmethod
-    def seconds_label(value):
-        value=float(value)
-        if value.is_integer(): return f"{int(value)} ثانیه"
-        return f"{value:g} ثانیه"
-
-
-class AuditService:
-    def __init__(self,store): self.store=store
-    def record(self,admin,action,details=""): self.store.audit(admin,action,clean(details))
-    def recent(self,limit=20): return [dict(row) for row in self.store.recent_audit(limit)]
-    def by_admin(self,admin,limit=50): return [dict(row) for row in self.store.all("SELECT * FROM audit WHERE admin_id=? ORDER BY id DESC LIMIT ?",(admin,limit))]
-    def count(self): return int(self.store.one("SELECT COUNT(*) FROM audit")[0])
-    def clear(self): self.store.execute("DELETE FROM audit")
-    def export_text(self,limit=100): return "\\n".join(f"{row['created_at']} | {row['admin_id']} | {row['action']} | {row['details']}" for row in self.store.recent_audit(limit))
-
-
-class PanelCatalog:
-    ITEMS={
-        "accounts":"مدیریت حساب‌های Session", "scenarios":"مدیریت سناریوهای مستقل", "test_manager":"تست اتصال Bot API",
-        "test_worker":"تست اتصال Worker", "backup":"پشتیبان‌گیری تنظیمات", "clear_audit":"پاک‌سازی گزارش",
-        "set_poll":"تنظیم polling", "set_timeout":"تنظیم timeout", "edit_account":"ویرایش حساب",
-        "delete_account":"حذف حساب", "toggle_account":"فعال‌سازی حساب", "edit_scenario":"ویرایش سناریو",
-        "delete_scenario":"حذف سناریو", "toggle_scenario":"فعال‌سازی سناریو", "help":"راهنمای استفاده"
-    }
-    @classmethod
-    def label(cls,key): return cls.ITEMS.get(key,"گزینهٔ ناشناخته")
-    @classmethod
-    def keys(cls): return tuple(cls.ITEMS)
-    @classmethod
-    def search(cls,term):
-        term=normalize(term); return {key:value for key,value in cls.ITEMS.items() if term in normalize(value) or term in normalize(key)}
-    @classmethod
-    def as_text(cls): return "\\n".join(f"{key}: {value}" for key,value in cls.ITEMS.items())
-
-
-class RuntimeGuard:
-    def __init__(self): self.started=time.monotonic(); self.stop_event=threading.Event()
-    def uptime(self): return time.monotonic()-self.started
-    def request_stop(self): self.stop_event.set()
-    def stopping(self): return self.stop_event.is_set()
-    def wait(self,seconds): return self.stop_event.wait(seconds)
-    def reset(self): self.stop_event.clear(); self.started=time.monotonic()
-
-
-class ScenarioService:
-    def __init__(self,store,hub): self.store=store; self.hub=hub
-    def validate_links(self,account_id,chat_id):
-        if not self.store.account(account_id): raise ValueError("حساب انتخاب‌شده وجود ندارد")
-        if not isinstance(chat_id,int): raise ValueError("chat_id عددی نیست")
-        return True
-    def create(self,name,account_id,chat_id,keyword,button,minutes,timeout):
-        name=clean(name); keyword=InputValidator.keyword(keyword); minutes=InputValidator.interval(str(minutes)); timeout=InputValidator.timeout(str(timeout)); self.validate_links(account_id,chat_id)
-        return self.store.create_scenario(name,account_id,chat_id,keyword,clean(button),minutes,timeout)
-    def enable(self,ident):
-        row=self.store.scenario(ident)
-        if not row: raise ValueError("سناریو وجود ندارد")
-        account=self.store.account(row["account_id"])
-        if not account: raise ValueError("حساب سناریو وجود ندارد")
-        if not account["enabled"]: raise ValueError("ابتدا حساب را روشن کنید")
-        self.store.set_scenario_enabled(ident,True); self.hub.start(account["id"]); return True
-    def disable(self,ident):
-        if not self.store.scenario(ident): raise ValueError("سناریو وجود ندارد")
-        self.store.set_scenario_enabled(ident,False); return True
-    def independent(self):
-        return [{"id":row["id"],"account":row["account_id"],"chat":row["chat_id"],"period":ScheduleMath.period(row["interval_minutes"])} for row in self.store.scenarios()]
-
-
-
-class SessionInspector:
-    def __init__(self, store): self.store=store
-    def inspect(self, ident):
-        row=self.store.account(ident)
-        if not row: return {"ok":False,"reason":"account-not-found"}
-        try:
-            raw=CRYPTO.decrypt(row["session_blob"].encode()).decode()
-            if len(raw)<80: return {"ok":False,"reason":"session-too-short","account":row["name"]}
-            return {"ok":True,"account":row["name"],"length":len(raw),"preview":secret_preview(raw),"enabled":bool(row["enabled"])}
-        except InvalidToken: return {"ok":False,"reason":"decrypt-failed","account":row["name"]}
-    def all(self): return [self.inspect(row["id"]) for row in self.store.accounts()]
-    def valid_count(self): return sum(1 for item in self.all() if item.get("ok"))
-    def invalid_count(self): return sum(1 for item in self.all() if not item.get("ok"))
-    def redact(self,item):
-        result=dict(item); result.pop("preview",None); return result
-    def safe_report(self): return [self.redact(item) for item in self.all()]
-
-
-class ConfigPolicy:
-    MAX_ACCOUNTS=50
-    MAX_SCENARIOS=500
-    MIN_INTERVAL=0.1
-    MAX_INTERVAL=10080.0
-    def check_account_limit(self,store):
-        if store.account_count()>=self.MAX_ACCOUNTS: raise ValueError("تعداد حساب‌ها به سقف مجاز رسیده است")
-        return True
-    def check_scenario_limit(self,store):
-        if store.scenario_count()>=self.MAX_SCENARIOS: raise ValueError("تعداد سناریوها به سقف مجاز رسیده است")
-        return True
-    def check_interval(self,value):
-        value=float(value)
-        if not self.MIN_INTERVAL<=value<=self.MAX_INTERVAL: raise ValueError("فاصلهٔ سناریو خارج از محدوده است")
-        return value
-    def check_timeout(self,value):
-        value=float(value)
-        if not 1<=value<=600: raise ValueError("timeout خارج از محدوده است")
-        return value
-    def check_name(self,value):
-        return InputValidator.account_name(value)
-
-
-def main(): ManagerBot().run()
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    asyncio.run(main())
