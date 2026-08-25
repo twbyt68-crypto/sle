@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import unicodedata
 import io
 import json
 import logging
@@ -71,12 +72,35 @@ def clean(value: Any) -> str:
 
 
 def normalize(value: Any) -> str:
-    return clean(value).casefold()
+    text=clean(value).casefold()
+    text=text.translate(str.maketrans({"ي":"ی","ى":"ی","ك":"ک","ۀ":"ه","ة":"ه","ؤ":"و","إ":"ا","أ":"ا","ـ":""}))
+    text=text.replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
+    text="".join(ch for ch in text if unicodedata.category(ch) not in {"Cf", "So", "Sk"})
+    text=re.sub(r"[\u2000-\u206f\u2e00-\u2e7f\u3000-\u303f]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def text_candidates(value: Any) -> list[str]:
+    raw=clean(value); variants=[raw]
+    for separator in ("|", "•", "—", "-", "✅", "🔘"):
+        variants.extend(part.strip() for part in raw.split(separator) if part.strip())
+    return list(dict.fromkeys(variants))
 
 
 def button_matches(value: Any, target: Any) -> bool:
-    left, right = normalize(value), normalize(target)
-    return bool(left and right and (left == right or left in right or right in left))
+    right=normalize(target)
+    if not right: return False
+    for candidate in text_candidates(value):
+        left=normalize(candidate)
+        if left and (left==right or left in right or right in left): return True
+    return False
+
+
+def button_label(button: Any) -> str:
+    for attribute in ("text", "label", "title"):
+        value=getattr(button,attribute,None)
+        if value: return str(value)
+    return ""
 
 
 def number(value: str, minimum: float = 0.1) -> float:
@@ -328,22 +352,25 @@ class UserWorker:
 
     async def execute_once(self, row: sqlite3.Row) -> bool:
         assert self.client
-        await self.client.send_message(int(row["chat_id"]), row["keyword"])
+        sent=await self.client.send_message(int(row["chat_id"]), row["keyword"])
         if not row["button"]: self.store.mark_scenario(row["id"], "sent-no-button"); return True
         attempts = max(1, int(float(row["timeout_seconds"]) / POLL_INTERVAL))
         for _ in range(attempts):
             await asyncio.sleep(POLL_INTERVAL)
-            if await self.find_and_click(int(row["chat_id"]), row["button"]): self.store.mark_scenario(row["id"], "clicked"); return True
+            if await self.find_and_click(int(row["chat_id"]), row["button"], min_id=getattr(sent,"id",None)):
+                self.store.mark_scenario(row["id"], "clicked"); return True
         self.store.mark_scenario(row["id"], "button-not-found"); return False
 
-    async def find_and_click(self, chat_id: int, target: str) -> bool:
+    async def find_and_click(self, chat_id: int, target: str, min_id: int | None = None) -> bool:
         assert self.client
-        async for message in self.client.iter_messages(chat_id, limit=RECENT_MESSAGES):
+        kwargs={"limit":RECENT_MESSAGES}
+        if min_id: kwargs["min_id"]=min_id
+        async for message in self.client.iter_messages(chat_id, **kwargs):
             markup = message.reply_markup
             if not markup or not hasattr(markup, "rows"): continue
             for ri, row in enumerate(markup.rows):
                 for ci, button in enumerate(getattr(row, "buttons", [])):
-                    if button_matches(getattr(button, "text", ""), target):
+                    if button_matches(button_label(button), target):
                         return await self.click(message, ri, ci, button, target)
         return False
 
