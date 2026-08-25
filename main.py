@@ -32,6 +32,10 @@ from telethon.errors import (ChatWriteForbiddenError, FloodWaitError,
                              MessageNotModifiedError, SessionPasswordNeededError,
                              UserNotParticipantError)
 from telethon.sessions import StringSession
+try:
+    from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+except ImportError:
+    GetBotCallbackAnswerRequest = None
 
 RELEASE_VERSION = "2026.08.25.10"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -363,25 +367,36 @@ class UserWorker:
 
     async def find_and_click(self, chat_id: int, target: str, min_id: int | None = None) -> bool:
         assert self.client
+        async def scan(kwargs):
+            async for message in self.client.iter_messages(chat_id, **kwargs):
+                markup=message.reply_markup
+                if not markup or not hasattr(markup,"rows"): continue
+                for ri,row in enumerate(markup.rows):
+                    for ci,button in enumerate(getattr(row,"buttons",[])):
+                        if button_matches(button_label(button),target):
+                            return await self.click(message,chat_id,ri,ci,button,target)
+            return False
         kwargs={"limit":RECENT_MESSAGES}
         if min_id: kwargs["min_id"]=min_id
-        async for message in self.client.iter_messages(chat_id, **kwargs):
-            markup = message.reply_markup
-            if not markup or not hasattr(markup, "rows"): continue
-            for ri, row in enumerate(markup.rows):
-                for ci, button in enumerate(getattr(row, "buttons", [])):
-                    if button_matches(button_label(button), target):
-                        return await self.click(message, ri, ci, button, target)
+        if await scan(kwargs): return True
+        if min_id: return await scan({"limit":RECENT_MESSAGES})
         return False
 
-    async def click(self, message: Any, ri: int, ci: int, button: Any, target: str) -> bool:
-        data = getattr(button, "data", None)
+    async def click(self, message: Any, chat_id: int, ri: int, ci: int, button: Any, target: str) -> bool:
+        data=getattr(button,"data",None)
+        if data and GetBotCallbackAnswerRequest:
+            try:
+                peer=await self.client.get_input_entity(chat_id)
+                await self.client(GetBotCallbackAnswerRequest(peer=peer,msg_id=message.id,data=data))
+                return True
+            except Exception as exc: log.debug("raw callback failed: %s",exc)
         if data:
             try: await message.click(data=data); return True
-            except Exception: pass
-        for action in (lambda: message.click(ri, ci), lambda: message.click(text=target)):
-            try: await action(); return True
-            except Exception: pass
+            except Exception as exc: log.debug("data click failed: %s",exc)
+        try: await message.click(ri,ci); return True
+        except Exception as exc: log.debug("position click failed: %s",exc)
+        try: await message.click(text=target); return True
+        except Exception as exc: log.debug("text click failed: %s",exc)
         return False
 
     async def test(self, chat_id: int, keyword: str, button: str) -> str:
