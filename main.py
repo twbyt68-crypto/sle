@@ -111,6 +111,22 @@ def parse_duration_minutes(value: str, unit: str = "minutes") -> float:
     return result
 
 
+def parse_scenario_values(values: list[str], meta: dict[str, Any] | None = None):
+    values=[clean(item) for item in values]; meta=meta or {}
+    if len(values)==6 and meta.get("account_id") is not None:
+        name,chat_id,keyword,button,interval,timeout=values
+        return name,int(chat_id),keyword,button,parse_duration_minutes(interval),parse_duration_minutes(timeout,"seconds"),int(meta["account_id"])
+    if len(values)>=7:
+        if re.fullmatch(r"-?\d+",values[1]) and re.fullmatch(r"-?\d+",values[2]):
+            name,account_id,chat_id,keyword,button,interval,timeout=values[:7]
+            return name,int(chat_id),keyword,button,parse_duration_minutes(interval),parse_duration_minutes(timeout,"seconds"),int(account_id)
+        numeric=[index for index,item in enumerate(values) if re.fullmatch(r"-?\d+",item) and (item.startswith("-") or item.startswith("-100"))]
+        if numeric:
+            chat_index=numeric[0]; name=values[0]; chat_id=int(values[chat_index]); keyword=values[1]; button=values[2] if len(values)>2 else ""; interval=values[3] if len(values)>3 else "3"; timeout=values[4] if len(values)>4 else "15"
+            return name,chat_id,keyword,button,parse_duration_minutes(interval),parse_duration_minutes(timeout,"seconds"),int(meta.get("account_id",0))
+    raise ValueError("ترتیب مراحل سناریو نامعتبر است؛ از مسیر جدید افزودن سناریو دوباره شروع کنید")
+
+
 def safe_html(value: Any) -> str:
     return html.escape(clean(value))
 
@@ -567,10 +583,7 @@ class ManagerBot:
             self.store.update_account(ident,clean(v[0]),clean(v[1]) or None); self.store.audit(user,"account-edit",str(ident)); self.hub.restart(ident); return "✅ حساب ویرایش شد."
         if kind in ("add_scenario","edit_scenario"):
             if kind == "add_scenario":
-                if len(v) == 6:
-                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(meta["account_id"]),int(v[1]),clean(v[2]),clean(v[3]),parse_duration_minutes(v[4]),parse_duration_minutes(v[5],"seconds")
-                else:
-                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),int(v[2]),clean(v[3]),clean(v[4]),parse_duration_minutes(v[5]),parse_duration_minutes(v[6],"seconds")
+                name,cid,keyword,button,minutes,timeout,aid=parse_scenario_values(v,meta)
                 if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد یا حذف شده است")
                 ident=self.store.create_scenario(name,aid,cid,keyword,button,minutes,timeout); action="scenario-add"
             else:
