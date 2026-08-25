@@ -14,7 +14,6 @@ import os
 import re
 import time
 import unicodedata
-import logging
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -57,11 +56,8 @@ DEFAULT_BUTTON   = "بفروش بره"
 SEARCH_LIMIT     = 50
 DEFAULT_KEYWORD  = "ماین"
 DEFAULT_INTERVAL = 180
-CLICK_RETRIES    = 120
-CLICK_WAIT       = 0.5
-VERSION          = "direct-userbot-2026.08.25"
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("mine-direct-userbot")
+CLICK_RETRIES    = 15
+CLICK_WAIT       = 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -103,12 +99,23 @@ class Config:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def normalize(text):
-    """Normalize Persian/Arabic button labels and remove decorative glyphs."""
-    text=unicodedata.normalize("NFKC", str(text or "")).casefold()
-    text=text.translate(str.maketrans({"ي":"ی","ى":"ی","ك":"ک","ۀ":"ه","ة":"ه","ؤ":"و","إ":"ا","أ":"ا","ـ":""}))
-    text=text.replace("\u200c","").replace("\u200d","").replace("\ufeff","")
-    text="".join(ch for ch in text if unicodedata.category(ch) not in {"Cf","So","Sk"})
-    return re.sub(r"\s+"," ",text).strip()
+    """Remove emojis, extra spaces, and normalize unicode for matching."""
+    text = unicodedata.normalize("NFKC", text)
+    # Remove emoji and special unicode symbols
+    cleaned = re.sub(
+        r'[\U0001F000-\U0001FFFF\U00002700-\U000027BF'
+        r'\U0000FE00-\U0000FE0F\U0000200D\U00002600-\U000026FF'
+        r'\U0000231A-\U0000231B\U00002328\U000023CF'
+        r'\U000023E9-\U000023F3\U000023F8-\U000023FA'
+        r'\U00002934-\U00002935\U000025AA-\U000025AB'
+        r'\U000025B6\U000025C0\U000025FB-\U000025FE'
+        r'\U00002B05-\U00002B07\U00002B1B-\U00002B1C'
+        r'\U00002B50\U00002B55\U00003030\U0000303D'
+        r'\U00003297\U00003299\U0000FE0F\U0000200D]+',
+        '', text
+    )
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
 
 
 def button_matches(btn_text, target):
@@ -456,10 +463,9 @@ class MineUserbot:
     # ── mine execution ───────────────────────────────────────
 
     async def _execute_mine(self, cid):
-        # Send once and keep the message id for precise reply filtering.
-        sent=None
+        # Step 1: Send keyword
         try:
-            sent=await self.client.send_message(cid, self.config.keyword)
+            await self.client.send_message(cid, self.config.keyword)
         except (ChatWriteForbiddenError, UserNotParticipantError):
             raise
         except FloodWaitError as e:
@@ -473,7 +479,7 @@ class MineUserbot:
         for _ in range(CLICK_RETRIES):
             await asyncio.sleep(CLICK_WAIT)
             try:
-                if await self._find_and_click(cid, min_id=getattr(sent,"id",None)):
+                if await self._find_and_click(cid):
                     return
             except FloodWaitError:
                 raise
@@ -484,26 +490,30 @@ class MineUserbot:
 
     # ── find button in recent messages ───────────────────────
 
-    async def _find_and_click(self, cid, min_id=None):
-        target=self.config.button_text
-        async def scan(kwargs):
-            async for msg in self.client.iter_messages(cid, **kwargs):
-                rm=getattr(msg,"reply_markup",None)
-                if not rm or not hasattr(rm,"rows"): continue
-                for ri,row in enumerate(rm.rows):
-                    for ci,btn in enumerate(getattr(row,"buttons",[])):
-                        if button_matches(getattr(btn,"text",""),target):
-                            log.info("button text matched: chat=%s message=%s row=%s col=%s text=%r",cid,msg.id,ri,ci,getattr(btn,"text",""))
-                            return await self._try_click(msg,cid,ri,ci,btn)
-            return False
+    async def _find_and_click(self, cid):
+        target = self.config.button_text
         try:
-            if await scan({"limit":SEARCH_LIMIT, **({"min_id":min_id} if min_id else {})}): return True
-            # Some bots edit or reuse a message; retain the original fallback scan.
-            if min_id: return await scan({"limit":SEARCH_LIMIT})
+            async for msg in self.client.iter_messages(
+                cid, limit=SEARCH_LIMIT
+            ):
+                rm = msg.reply_markup
+                if not rm or not hasattr(rm, "rows"):
+                    continue
+
+                for ri, row in enumerate(rm.rows):
+                    if not hasattr(row, "buttons"):
+                        continue
+                    for ci, btn in enumerate(row.buttons):
+                        btn_text = getattr(btn, "text", "")
+                        if button_matches(btn_text, target):
+                            return await self._try_click(
+                                msg, cid, ri, ci, btn
+                            )
+
         except FloodWaitError:
             raise
-        except Exception as exc:
-            log.exception("button scan failed: %s",exc)
+        except Exception:
+            pass
         return False
 
     # ── click button (4 fallback methods) ────────────────────
@@ -522,32 +532,31 @@ class MineUserbot:
                         data=data,
                     )
                 )
-                log.info("raw callback accepted: chat=%s message=%s row=%s col=%s",cid,msg.id,ri,ci)
                 return True
-            except Exception as exc:
-                log.debug("raw callback failed: %s",exc)
+            except Exception:
+                pass
 
         # Method 2: click with callback data
         if data:
             try:
                 await msg.click(data=data)
                 return True
-            except Exception as exc:
-                log.debug("callback data click failed: %s",exc)
+            except Exception:
+                pass
 
         # Method 3: click by position
         try:
             await msg.click(ri, ci)
             return True
-        except Exception as exc:
-            log.debug("position click failed: %s",exc)
+        except Exception:
+            pass
 
         # Method 4: click by text
         try:
             await msg.click(text=self.config.button_text)
             return True
-        except Exception as exc:
-            log.debug("text click failed: %s",exc)
+        except Exception:
+            pass
 
         return False
 
