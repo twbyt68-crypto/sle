@@ -85,6 +85,32 @@ def number(value: str, minimum: float = 0.1) -> float:
     return parsed
 
 
+def parse_duration_minutes(value: str, unit: str = "minutes") -> float:
+    text=clean(value).casefold().replace("،", ",").replace(",", ".")
+    if not text: raise ValueError("زمان خالی است")
+    aliases={"دقیقه":"minutes","دقیقه‌ای":"minutes","m":"minutes","min":"minutes","mins":"minutes","ساعت":"hours","ساعته":"hours","h":"hours","hr":"hours","ثانیه":"seconds","ثانیه‌ای":"seconds","s":"seconds","sec":"seconds"}
+    for suffix, normalized in aliases.items():
+        if text.endswith(suffix): unit=normalized; text=text[:-len(suffix)].strip(); break
+    if ":" in text:
+        parts=text.split(":")
+        if len(parts)==2:
+            major,minor=parts
+            if not major.isdigit() or not re.fullmatch(r"\d{1,2}",minor): raise ValueError("قالب زمان باید مثل 3:05 باشد")
+            if int(minor)>=60: raise ValueError("ثانیه/دقیقهٔ بخش دوم باید کمتر از 60 باشد")
+            seconds=int(major)*60+int(minor); return seconds/60
+        if len(parts)==3:
+            h,m,s=parts
+            if not all(re.fullmatch(r"\d+",x) for x in parts) or int(m)>=60 or int(s)>=60: raise ValueError("قالب زمان باید مثل 1:03:05 باشد")
+            return (int(h)*3600+int(m)*60+int(s))/60
+        raise ValueError("قالب زمان نامعتبر است")
+    parsed=float(text)
+    factors={"minutes":1.0,"hours":60.0,"seconds":1/60}
+    if unit not in factors: raise ValueError("واحد زمان باید ساعت، دقیقه یا ثانیه باشد")
+    result=parsed*factors[unit]
+    if result<=0: raise ValueError("زمان باید بیشتر از صفر باشد")
+    return result
+
+
 def safe_html(value: Any) -> str:
     return html.escape(clean(value))
 
@@ -353,9 +379,60 @@ class Flow:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class LoginAttempt:
+    user_id: int
+    chat_id: int
+    name: str
+    phone: str
+    loop: Any = None
+    client: TelegramClient | None = None
+    phone_code_hash: str = ""
+    thread: threading.Thread | None = None
+    finished: bool = False
+
+
+class LoginBroker:
+    def __init__(self, store, hub, notifier):
+        self.store=store; self.hub=hub; self.notifier=notifier; self.attempts={}; self.lock=threading.RLock()
+    def start(self,user,chat,name,phone):
+        attempt=LoginAttempt(user,chat,clean(name),clean(phone)); self.attempts[user]=attempt
+        def runner():
+            loop=asyncio.new_event_loop(); asyncio.set_event_loop(loop); attempt.loop=loop; attempt.client=TelegramClient(StringSession(),API_ID,API_HASH)
+            try: loop.run_until_complete(self._send_code(attempt)); loop.run_forever()
+            except Exception as exc: log.exception("phone login start failed"); self.notifier(chat,f"❌ شروع ورود ناموفق: {safe_html(exc)}")
+            finally:
+                if attempt.client: loop.run_until_complete(attempt.client.disconnect())
+                loop.close()
+        attempt.thread=threading.Thread(target=runner,daemon=True,name=f"login-{user}"); attempt.thread.start()
+    async def _send_code(self,attempt):
+        await attempt.client.connect(); sent=await attempt.client.send_code_request(attempt.phone); attempt.phone_code_hash=sent.phone_code_hash
+    def submit(self,user,kind,value):
+        attempt=self.attempts.get(user)
+        if not attempt or not attempt.loop or not attempt.client: return
+        asyncio.run_coroutine_threadsafe(self._finish_step(attempt,kind,value),attempt.loop)
+    async def _finish_step(self,attempt,kind,value):
+        try:
+            if kind=="code": await attempt.client.sign_in(attempt.phone,value,phone_code_hash=attempt.phone_code_hash)
+            elif kind=="password":
+                if value: await attempt.client.sign_in(password=value)
+                else:
+                    if not await attempt.client.is_user_authorized(): raise RuntimeError("رمز دومرحله‌ای لازم است؛ مقدار رمز را وارد کنید")
+            if await attempt.client.is_user_authorized(): await self.finish(attempt)
+        except SessionPasswordNeededError:
+            self.notifier(attempt.chat_id,"🔐 این حساب رمز دومرحله‌ای دارد؛ رمز را وارد کنید.")
+        except Exception as exc:
+            self.notifier(attempt.chat_id,f"❌ ورود ناموفق: {safe_html(exc)}")
+    async def finish(self,attempt):
+        session=attempt.client.session.save(); ident=self.store.create_account(attempt.name,session); self.store.audit(attempt.user_id,"phone-login-complete",str(ident)); self.hub.start(ident); attempt.finished=True; self.notifier(attempt.chat_id,"✅ ورود حساب کامل شد و Worker فعال شد."); self.attempts.pop(attempt.user_id,None); attempt.loop.stop()
+    def cancel(self,user):
+        attempt=self.attempts.pop(user,None)
+        if attempt and attempt.loop: attempt.loop.call_soon_threadsafe(attempt.loop.stop)
+
+
 class ManagerBot:
     def __init__(self):
-        self.api=f"https://api.telegram.org/bot{MANAGER_BOT_TOKEN}"; self.store=Store(); self.hub=WorkerHub(self.store); self.flows={}; self.offset=0
+        self.api=f"https://api.telegram.org/bot{MANAGER_BOT_TOKEN}"; self.store=Store(); self.hub=WorkerHub(self.store); self.flows={}; self.offset=0; self.login=LoginBroker(self.store,self.hub,self.send)
 
     def _remove_button_styles(self, value):
         if isinstance(value, dict): return {k:self._remove_button_styles(v) for k,v in value.items() if k not in {"style","icon_custom_emoji_id"}}
@@ -421,6 +498,16 @@ class ManagerBot:
         rows=[[self.button(f"👤 {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.accounts() if row['enabled']]
         rows.append([self.button("↩️ بازگشت", "accounts" if action == "edit_account_pick" else "scenarios")])
         self.send(chat, "<b>حساب را انتخاب کنید</b>\nشناسه را دستی وارد نکنید.", rows, edit)
+    def edit_stage_menu(self, chat, kind, ident, edit=None):
+        if kind == "account":
+            title="<b>ویرایش حساب — مرحله را انتخاب کنید</b>"
+            items=[("1️⃣ نام حساب","account_name"),("2️⃣ Session String","account_session")]
+        else:
+            title="<b>ویرایش سناریو — مرحله را انتخاب کنید</b>"
+            items=[("1️⃣ نام سناریو","scenario_name"),("2️⃣ chat_id گروه","scenario_chat"),("3️⃣ کلمه/فرمان","scenario_keyword"),("4️⃣ متن دکمه","scenario_button"),("5️⃣ فاصلهٔ اجرا","scenario_interval"),("6️⃣ timeout","scenario_timeout")]
+        keys=[[self.button(label,f"edit_stage:{kind}:{ident}:{field}")] for label,field in items]
+        keys.append(self.back("accounts" if kind == "account" else "scenarios")[0:1][0:1])
+        self.send(chat,title+"\n\nفقط عدد مرحلهٔ موردنظر را انتخاب کنید؛ سایر تنظیمات تغییر نمی‌کنند.",keys,edit)
     def choose_scenario(self, chat, action, edit=None):
         rows=[[self.button(f"⚙️ {safe_html(row['name'])} · #{row['id']}", f"{action}:{row['id']}")] for row in self.store.scenarios()]
         rows.append([self.button("↩️ بازگشت", "scenarios")])
@@ -433,7 +520,16 @@ class ManagerBot:
         flow=self.flows[user]; self.send(chat,f"<b>مرحلهٔ {flow.index+1} از {len(flow.prompts)}</b>\n{flow.prompts[flow.index]}\n\nلغو: /cancel",[[self.button("❌ لغو","cancel")]])
     def receive_flow(self,user,chat,text):
         flow=self.flows[user]
-        if text=="/cancel": self.flows.pop(user,None); return self.home(chat)
+        if text=="/cancel": self.login.cancel(user); self.flows.pop(user,None); return self.home(chat)
+        if flow.kind == "phone_code":
+            self.login.submit(user,"code",text.strip()); self.flows[user]=Flow("phone_2fa",["رمز دومرحله‌ای؛ اگر ندارید /skip بفرستید"]); return self.send(chat,"✅ کد دریافت شد. اگر حساب رمز دومرحله‌ای دارد، رمز را بفرستید؛ در غیر این صورت /skip.",[[self.button("❌ لغو","cancel")]])
+        if flow.kind == "phone_2fa":
+            self.login.submit(user,"password","" if text == "/skip" else text.strip()); self.flows.pop(user,None); return self.send(chat,"⏳ ورود در حال نهایی‌شدن است.",self.back("accounts"))
+        flow.values.append(text.strip()); flow.index+=1
+        if flow.kind == "phone_start":
+            if flow.index < len(flow.prompts): return self.prompt_next(user,chat)
+            name,phone=flow.values; self.flows.pop(user,None); self.login.start(user,chat,name,phone); self.flows[user]=Flow("phone_code",["کد ورود Telegram"]); return self.send(chat,"📨 کد ورود ارسال شد؛ کد را همین‌جا بفرستید.",[[self.button("❌ لغو","cancel")]])
+        if flow.index<len(flow.prompts): return self.prompt_next(user,chat)
         flow.values.append(text.strip()); flow.index+=1
         if flow.index<len(flow.prompts): return self.prompt_next(user,chat)
         values=flow.values; self.flows.pop(user,None)
@@ -444,6 +540,27 @@ class ManagerBot:
         meta=meta or {}
         if kind=="add_account":
             ident=self.store.create_account(clean(v[0]),clean(v[1])); self.store.audit(user,"account-add",str(ident)); self.hub.start(ident); return "✅ حساب و Session ثبت شد و Worker در حال اتصال است."
+        if kind=="edit_stage_value":
+            ident=int(meta["id"]); kind_name=meta["kind"]; field=meta["field"]; row=self.store.account(ident) if kind_name=="account" else self.store.scenario(ident)
+            if not row: raise ValueError("مورد انتخاب‌شده پیدا نشد")
+            value=clean(v[0])
+            if kind_name=="account":
+                if field=="account_name": self.store.update_account(ident,value)
+                elif field=="account_session":
+                    if value!="/skip": self.store.update_account(ident,row["name"],InputValidator.session(value))
+                    else: return "✅ بدون تغییر ذخیره شد."
+                else: raise ValueError("مرحله حساب نامعتبر است")
+            else:
+                name,aid,cid,keyword,button,minutes,timeout=row["name"],row["account_id"],row["chat_id"],row["keyword"],row["button"],row["interval_minutes"],row["timeout_seconds"]
+                if field=="scenario_name": name=value
+                elif field=="scenario_chat": cid=InputValidator.chat_id(value)
+                elif field=="scenario_keyword": keyword=InputValidator.keyword(value)
+                elif field=="scenario_button": button="" if value=="/none" else value
+                elif field=="scenario_interval": minutes=parse_duration_minutes(value)
+                elif field=="scenario_timeout": timeout=parse_duration_minutes(value,"seconds")
+                else: raise ValueError("مرحله سناریو نامعتبر است")
+                self.store.update_scenario(ident,name,aid,cid,keyword,button,minutes,timeout)
+            self.store.audit(user,"edit-stage",f"{kind_name}:{ident}:{field}"); return "✅ فقط همان مرحله ویرایش شد و سایر تنظیمات حفظ شدند."
         if kind=="edit_account":
             ident=int(meta.get("account_id", 0))
             if not self.store.account(ident): raise ValueError("حساب انتخاب‌شده پیدا نشد")
@@ -451,16 +568,16 @@ class ManagerBot:
         if kind in ("add_scenario","edit_scenario"):
             if kind == "add_scenario":
                 if len(v) == 6:
-                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(meta["account_id"]),int(v[1]),clean(v[2]),clean(v[3]),number(v[4]),number(v[5],1)
+                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(meta["account_id"]),int(v[1]),clean(v[2]),clean(v[3]),parse_duration_minutes(v[4]),parse_duration_minutes(v[5],"seconds")
                 else:
-                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),int(v[2]),clean(v[3]),clean(v[4]),number(v[5]),number(v[6],1)
+                    name,aid,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),int(v[2]),clean(v[3]),clean(v[4]),parse_duration_minutes(v[5]),parse_duration_minutes(v[6],"seconds")
                 if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد یا حذف شده است")
                 ident=self.store.create_scenario(name,aid,cid,keyword,button,minutes,timeout); action="scenario-add"
             else:
                 if len(v) == 6:
-                    ident=int(meta.get("scenario_id", 0)); aid=int(meta.get("account_id", 0)); name,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),clean(v[2]),clean(v[3]),number(v[4]),number(v[5],1)
+                    ident=int(meta.get("scenario_id", 0)); aid=int(meta.get("account_id", 0)); name,cid,keyword,button,minutes,timeout=clean(v[0]),int(v[1]),clean(v[2]),clean(v[3]),parse_duration_minutes(v[4]),parse_duration_minutes(v[5],"seconds")
                 else:
-                    ident=int(v[0]); name,aid,cid,keyword,button,minutes,timeout=clean(v[1]),int(v[2]),int(v[3]),clean(v[4]),clean(v[5]),number(v[6]),number(v[7],1)
+                    ident=int(v[0]); name,aid,cid,keyword,button,minutes,timeout=clean(v[1]),int(v[2]),int(v[3]),clean(v[4]),clean(v[5]),parse_duration_minutes(v[6]),parse_duration_minutes(v[7],"seconds")
                 if not self.store.scenario(ident): raise ValueError("سناریوی انتخاب‌شده وجود ندارد")
                 if not self.store.account(aid): raise ValueError("حساب انتخاب‌شده وجود ندارد")
                 self.store.update_scenario(ident,name,aid,cid,keyword,button,minutes,timeout); action="scenario-edit"
@@ -488,12 +605,16 @@ class ManagerBot:
             return
         if data=="list_accounts": return self.list_accounts(chat,msg)
         if data=="list_scenarios": return self.list_scenarios(chat,msg)
-        if data=="add_account": return self.begin(user,chat,data,["نام نمایشی حساب","Session String کامل Telethon"],msg)
+        if data=="add_account":
+            keys=[[self.button("🔐 ورود با Session String","add_account_session")],[self.button("📱 ورود با شماره و کد","add_account_phone")],self.back("accounts")[0]]
+            return self.send(chat,"<b>روش ورود حساب را انتخاب کنید</b>\n\nSession String یا ورود معمولی با شماره، کد Telegram و در صورت نیاز رمز دومرحله‌ای.",keys,msg)
+        if data=="add_account_session": return self.begin(user,chat,"add_account",["نام نمایشی حساب","Session String کامل Telethon"],msg)
+        if data=="add_account_phone": return self.begin(user,chat,"phone_start",["نام نمایشی حساب","شماره تلفن با کد کشور؛ مثل +989121234567"],msg)
         if data=="edit_account": return self.choose_account_action(chat,"pick_edit_account",msg)
         if data.startswith("pick_edit_account:"):
             ident=int(data.split(":",1)[1]); row=self.store.account(ident)
             if not row: return self.send(chat,"❌ حساب پیدا نشد.",self.back("accounts"),msg)
-            return self.begin(user,chat,"edit_account",["نام جدید","Session جدید؛ برای حفظ قبلی خالی بفرستید"],msg,{"account_id":ident})
+            return self.edit_stage_menu(chat,"account",ident,msg)
         if data=="add_scenario": return self.choose_account(chat,"pick_scenario_account",msg)
         if data.startswith("pick_scenario_account:"):
             aid=int(data.split(":",1)[1]);
@@ -503,7 +624,12 @@ class ManagerBot:
         if data.startswith("pick_edit_scenario:"):
             ident=int(data.split(":",1)[1]); row=self.store.scenario(ident)
             if not row: return self.send(chat,"❌ سناریو پیدا نشد.",self.back("scenarios"),msg)
-            return self.begin(user,chat,"edit_scenario",["نام جدید","chat_id گروه","کلمه یا فرمان","متن دکمه؛ بدون دکمه خالی","فاصله برحسب دقیقه","timeout برحسب ثانیه"],msg,{"scenario_id":ident,"account_id":row["account_id"]})
+            return self.edit_stage_menu(chat,"scenario",ident,msg)
+        if data.startswith("edit_stage:"):
+            _,kind,ident,field=data.split(":",3); ident=int(ident)
+            prompts={"account_name":"نام جدید حساب","account_session":"Session جدید؛ برای حفظ قبلی /skip بفرستید","scenario_name":"نام جدید سناریو","scenario_chat":"chat_id جدید گروه","scenario_keyword":"کلمه یا فرمان جدید","scenario_button":"متن دکمهٔ جدید؛ برای حذف دکمه /none","scenario_interval":"فاصلهٔ جدید؛ مثل 3:05 یا 2 ساعت","scenario_timeout":"timeout جدید؛ مثل 15 ثانیه"}
+            if field not in prompts: return self.send(chat,"❌ مرحله نامعتبر است.",self.back("home"),msg)
+            return self.begin(user,chat,"edit_stage_value",[prompts[field]],msg,{"kind":kind,"id":ident,"field":field})
         if data=="set_poll": return self.begin(user,chat,data,["فاصله polling برحسب ثانیه؛ پیشنهاد 0.5"],msg)
         if data=="set_timeout": return self.begin(user,chat,data,["timeout پیش‌فرض برحسب ثانیه"],msg)
         if data=="toggle_account": return self.choose_account_action(chat,"pick_toggle_account",msg)
@@ -524,7 +650,7 @@ class ManagerBot:
             _,kind,ident=data.split(":"); return self.confirm_delete_callback(user,chat,kind,int(ident),msg)
         if data=="backup": return self.send(chat,"<pre>"+safe_html(self.store.export_json())+"</pre>",self.back("tools"),msg)
         if data=="clear_audit": self.store.execute("DELETE FROM audit"); self.send(chat,"✅ گزارش پاک شد.",self.back("tools"),msg); return
-        if data=="cancel": self.flows.pop(user,None); return self.home(chat,msg)
+        if data=="cancel": self.login.cancel(user); self.flows.pop(user,None); return self.home(chat,msg)
         self.send(chat,"❌ گزینه ناشناخته است.",self.back(),msg)
     def toggle_choice(self, chat, kind, ident, edit=None):
         row = self.store.account(ident) if kind == "account" else self.store.scenario(ident)
@@ -624,7 +750,7 @@ class InputValidator:
         return value
     @staticmethod
     def interval(value):
-        parsed=number(value)
+        parsed=parse_duration_minutes(value)
         if parsed>10080: raise ValueError("فاصله نمی‌تواند بیشتر از یک هفته باشد")
         return parsed
     @staticmethod
